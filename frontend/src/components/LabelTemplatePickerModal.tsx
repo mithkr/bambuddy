@@ -4,11 +4,13 @@ import { X, Loader2, Printer, CheckSquare, Square, Search } from 'lucide-react';
 import { api, type SpoolLabelTemplate, type InventorySpool } from '../api/client';
 import { Button } from './Button';
 import { useToast } from '../contexts/ToastContext';
+import { getSwatchStyle, resolveSpoolColorName } from '../utils/colors';
+import { useColorCatalogVersion } from '../hooks/useColorCatalogVersion';
 
 /** Subset of InventorySpool the modal needs for checkbox rendering. */
 type SpoolForLabel = Pick<
   InventorySpool,
-  'id' | 'material' | 'subtype' | 'brand' | 'color_name' | 'rgba'
+  'id' | 'material' | 'subtype' | 'brand' | 'color_name' | 'color_name_is_synthesized' | 'rgba'
 >;
 
 interface LabelTemplatePickerModalProps {
@@ -33,10 +35,16 @@ interface TemplateOption {
 
 const TEMPLATE_OPTIONS: TemplateOption[] = [
   {
-    value: 'ams_30x15',
-    i18nKey: 'ams',
-    fallbackLabel: 'AMS holder (30 × 15 mm)',
-    fallbackHint: 'Single label per page; fits the popular AMS filament label holder.',
+    value: 'ams_holder_74x33',
+    i18nKey: 'amsHolderSmall',
+    fallbackLabel: 'AMS holder — small (74 × 33 mm)',
+    fallbackHint: 'Single label per page; matches the printable label from MakerWorld model 752566 (AMS Filament Label Holder).',
+  },
+  {
+    value: 'ams_holder_75x55',
+    i18nKey: 'amsHolderLarge',
+    fallbackLabel: 'AMS holder — large (75 × 55 mm)',
+    fallbackHint: 'Single label per page; fits the cardstock-insert variant of the AMS Filament Label Holder. Roomy enough for swatch, brand, material, ID, and QR code.',
   },
   {
     value: 'box_40x30',
@@ -64,9 +72,25 @@ const TEMPLATE_OPTIONS: TemplateOption[] = [
   },
 ];
 
+const SHEET_CAPACITIES: Partial<Record<SpoolLabelTemplate, number>> = {
+  avery_l7160: 21,
+  avery_5160: 30,
+};
+
+const MAX_SHEET_CAPACITY = Math.max(...Object.values(SHEET_CAPACITIES));
+
 function openBlobInNewTab(blob: Blob): void {
   const url = window.URL.createObjectURL(blob);
-  const win = window.open(url, '_blank', 'noopener,noreferrer');
+  // Do NOT pass `noopener,noreferrer`: per the WindowFeatures spec, `noopener`
+  // forces window.open to return `null` even on success, which made the
+  // `if (!win)` popup-block fallback below fire on EVERY click — so the blob
+  // tab opened (downloading a random-named PDF on systems without an inline
+  // viewer) AND the `<a download>` fallback fired (downloading a second copy
+  // named bambuddy-labels.pdf). Two identical PDFs per click — issue #1628.
+  // The blob is same-origin, the destination is a passive PDF tab with no
+  // script context, and `noreferrer` is a no-op for blob URLs, so dropping
+  // these flags has no security impact.
+  const win = window.open(url, '_blank');
   if (!win) {
     const a = document.createElement('a');
     a.href = url;
@@ -78,24 +102,77 @@ function openBlobInNewTab(blob: Blob): void {
   setTimeout(() => window.URL.revokeObjectURL(url), 60_000);
 }
 
+// Thin wrapper over `getSwatchStyle` from utils/colors so the modal's render
+// sites keep their existing call shape. Transparent (alpha=00) spools now
+// render as a checkerboard pattern instead of collapsing to solid black
+// (#1545).
 function swatchStyle(rgba: string | null | undefined): React.CSSProperties {
-  if (!rgba) return { backgroundColor: '#808080' };
-  const cleaned = rgba.replace(/^#/, '').slice(0, 6);
-  return cleaned.length === 6 ? { backgroundColor: `#${cleaned}` } : { backgroundColor: '#808080' };
+  return getSwatchStyle(rgba);
+}
+
+function labelColorName(s: SpoolForLabel): string | null {
+  return resolveSpoolColorName(s.color_name, s.rgba, s.color_name_is_synthesized);
 }
 
 function spoolDisplayName(s: SpoolForLabel): string {
-  const head = s.color_name ?? `${s.material}${s.subtype ? ` ${s.subtype}` : ''}`;
+  // Resolved, not stored: most Bambu spools arrive with no colour name on the
+  // tag, and picking a label template for "PLA Silk" tells you nothing about
+  // which of six red spools you are looking at (#3090).
+  const head = labelColorName(s) ?? `${s.material}${s.subtype ? ` ${s.subtype}` : ''}`;
   const brand = s.brand ? ` · ${s.brand}` : '';
   return `${head}${brand}`;
 }
 
 /** Build a lowercased haystack that the search input matches against. */
 function searchableText(s: SpoolForLabel): string {
-  return [s.color_name, s.material, s.subtype, s.brand, `#${s.id}`]
+  return [labelColorName(s), s.color_name, s.material, s.subtype, s.brand, `#${s.id}`]
     .filter(Boolean)
     .join(' ')
     .toLowerCase();
+}
+
+type SortMode = 'id' | 'color';
+
+/** Sort key for the "by colour" mode (#1410).
+ *
+ * Returns a 2-tuple so JS array compare does the right thing without us having
+ * to spell out a comparator: ``[bucket, position]``. Chromatic colours
+ * (saturation above the threshold) go in bucket 0 ordered by HSL hue, so the
+ * sheet reads as a continuous rainbow. Achromatic colours (white / grey /
+ * black, plus missing/invalid rgba) go in bucket 1 ordered by lightness so the
+ * neutrals trail at the end of the rainbow going dark → light. Multi-colour
+ * spools sort on their primary ``rgba``; their ``extra_colors`` stripe is
+ * still rendered on the label itself but doesn't drive the sort.
+ */
+function colorSortKey(rgba: string | null | undefined): [number, number] {
+  if (!rgba) return [1, 0]; // unknown colour — bucket with the neutrals at black
+  const cleaned = rgba.replace(/^#/, '').slice(0, 6);
+  if (cleaned.length !== 6) return [1, 0];
+  const r = parseInt(cleaned.slice(0, 2), 16);
+  const g = parseInt(cleaned.slice(2, 4), 16);
+  const b = parseInt(cleaned.slice(4, 6), 16);
+  if ([r, g, b].some(Number.isNaN)) return [1, 0];
+
+  const rn = r / 255;
+  const gn = g / 255;
+  const bn = b / 255;
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const l = (max + min) / 2;
+  const delta = max - min;
+  // Saturation in the HSL definition. Achromatic cutoff at 0.1 is generous —
+  // matches what feels "grey enough" to a user picking colours, without
+  // sending dark muted colours like deep navy into the neutrals bucket.
+  const s = delta === 0 ? 0 : delta / (1 - Math.abs(2 * l - 1));
+  if (s < 0.1) return [1, l]; // neutrals: ordered black → white
+
+  let h = 0;
+  if (max === rn) h = ((gn - bn) / delta) % 6;
+  else if (max === gn) h = (bn - rn) / delta + 2;
+  else h = (rn - gn) / delta + 4;
+  h = h * 60;
+  if (h < 0) h += 360;
+  return [0, h]; // chromatic: ordered by hue 0..360
 }
 
 export function LabelTemplatePickerModal({
@@ -106,11 +183,17 @@ export function LabelTemplatePickerModal({
   spoolmanMode,
 }: LabelTemplatePickerModalProps) {
   const { t } = useTranslation();
+  // The spool filter below resolves colour names through the catalog; its
+  // memo has to recompute when the catalog finishes loading (#3090).
+  const colorCatalogVersion = useColorCatalogVersion();
   const { showToast } = useToast();
   const [pending, setPending] = useState<SpoolLabelTemplate | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [search, setSearch] = useState('');
   const [materialFilter, setMaterialFilter] = useState<string>('');
+  const [sortMode, setSortMode] = useState<SortMode>('id');
+  const [monochrome, setMonochrome] = useState(false);
+  const [startingPositionInput, setStartingPositionInput] = useState('1');
 
   // Sync from caller and reset transient state on open. Intentionally not
   // reactive to props while open — once the user starts editing we don't want
@@ -121,15 +204,31 @@ export function LabelTemplatePickerModal({
       setSelectedIds(new Set(initialSelectedIds.filter((id) => allowed.has(id))));
       setSearch('');
       setMaterialFilter('');
+      setSortMode('id');
+      setMonochrome(false);
+      setStartingPositionInput('1');
       setPending(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
-  const sortedSpools = useMemo(
-    () => [...availableSpools].sort((a, b) => a.id - b.id),
-    [availableSpools],
-  );
+  const sortedSpools = useMemo(() => {
+    const copy = [...availableSpools];
+    if (sortMode === 'color') {
+      copy.sort((a, b) => {
+        const ka = colorSortKey(a.rgba);
+        const kb = colorSortKey(b.rgba);
+        if (ka[0] !== kb[0]) return ka[0] - kb[0];
+        if (ka[1] !== kb[1]) return ka[1] - kb[1];
+        // Stable tiebreaker on ID so identical colours print in a deterministic
+        // order across renders.
+        return a.id - b.id;
+      });
+      return copy;
+    }
+    copy.sort((a, b) => a.id - b.id);
+    return copy;
+  }, [availableSpools, sortMode]);
 
   // Material chips are derived from the *full* available set so they stay
   // stable when search/material filter narrows the visible list.
@@ -142,13 +241,18 @@ export function LabelTemplatePickerModal({
   }, [sortedSpools]);
 
   const visibleSpools = useMemo(() => {
+    // Named so this memo depends on it: searchableText resolves colour names
+    // through the catalog, which resolveSpoolColorName reads from module state
+    // the linter cannot follow. Without it a query typed before the catalog
+    // loads keeps its empty result (#3090).
+    void colorCatalogVersion;
     const q = search.trim().toLowerCase();
     return sortedSpools.filter((s) => {
       if (materialFilter && (s.material || '').toUpperCase() !== materialFilter) return false;
       if (q && !searchableText(s).includes(q)) return false;
       return true;
     });
-  }, [sortedSpools, search, materialFilter]);
+  }, [sortedSpools, search, materialFilter, colorCatalogVersion]);
 
   const allVisibleChecked =
     visibleSpools.length > 0 && visibleSpools.every((s) => selectedIds.has(s.id));
@@ -157,6 +261,11 @@ export function LabelTemplatePickerModal({
 
   const selectedCount = selectedIds.size;
   const noSelection = selectedCount === 0;
+  const startingPosition = Number(startingPositionInput);
+  const startingPositionIsValid =
+    Number.isInteger(startingPosition) &&
+    startingPosition >= 1 &&
+    startingPosition <= MAX_SHEET_CAPACITY;
 
   function toggleOne(id: number) {
     setSelectedIds((prev) => {
@@ -189,12 +298,40 @@ export function LabelTemplatePickerModal({
 
   async function handlePick(template: SpoolLabelTemplate) {
     if (noSelection || pending) return;
-    const ids = [...selectedIds].sort((a, b) => a - b);
+    const sheetCapacity = SHEET_CAPACITIES[template];
+    if (
+      sheetCapacity !== undefined &&
+      (!startingPositionIsValid || startingPosition > sheetCapacity)
+    ) {
+      showToast(
+        t(
+          'inventory.labels.startingPositionRangeError',
+          'Starting position must be between 1 and {{capacity}} for this sheet.',
+          { capacity: sheetCapacity },
+        ),
+        'error',
+      );
+      return;
+    }
+    // Order matters: the backend (labels.py) prints labels in the same order
+    // we send IDs. Use the sorted list so a "by colour" sort flows through to
+    // the PDF instead of being clobbered by an ascending-ID re-sort.
+    const ids = sortedSpools.filter((s) => selectedIds.has(s.id)).map((s) => s.id);
     setPending(template);
     try {
       const blob = spoolmanMode
-        ? await api.printSpoolmanSpoolLabels({ spool_ids: ids, template })
-        : await api.printSpoolLabels({ spool_ids: ids, template });
+        ? await api.printSpoolmanSpoolLabels({
+            spool_ids: ids,
+            template,
+            monochrome,
+            starting_position: sheetCapacity === undefined ? 1 : startingPosition,
+          })
+        : await api.printSpoolLabels({
+            spool_ids: ids,
+            template,
+            monochrome,
+            starting_position: sheetCapacity === undefined ? 1 : startingPosition,
+          });
       openBlobInNewTab(blob);
       onClose();
     } catch (err) {
@@ -215,7 +352,10 @@ export function LabelTemplatePickerModal({
         onClick={onClose}
       />
 
-      <div className="relative w-full max-w-3xl bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl shadow-2xl max-h-[90vh] overflow-hidden flex flex-col my-auto">
+      <div
+        data-testid="label-template-picker-panel"
+        className="relative w-full max-w-3xl bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl shadow-2xl max-h-[90vh] overflow-clip flex flex-col my-auto"
+      >
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary">
           <div className="flex items-center gap-2">
@@ -282,6 +422,33 @@ export function LabelTemplatePickerModal({
               ))}
             </div>
           )}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs text-bambu-gray mr-1">
+              {t('inventory.labels.sortBy.label')}
+            </span>
+            <button
+              type="button"
+              onClick={() => setSortMode('id')}
+              className={`px-2 py-0.5 text-xs rounded-full border transition ${
+                sortMode === 'id'
+                  ? 'bg-bambu-green text-bambu-dark border-bambu-green'
+                  : 'bg-bambu-dark text-bambu-gray border-bambu-dark-tertiary hover:border-bambu-gray'
+              }`}
+            >
+              {t('inventory.labels.sortBy.id')}
+            </button>
+            <button
+              type="button"
+              onClick={() => setSortMode('color')}
+              className={`px-2 py-0.5 text-xs rounded-full border transition ${
+                sortMode === 'color'
+                  ? 'bg-bambu-green text-bambu-dark border-bambu-green'
+                  : 'bg-bambu-dark text-bambu-gray border-bambu-dark-tertiary hover:border-bambu-gray'
+              }`}
+            >
+              {t('inventory.labels.sortBy.color')}
+            </button>
+          </div>
         </div>
 
         {/* Action bar */}
@@ -357,18 +524,98 @@ export function LabelTemplatePickerModal({
           )}
         </div>
 
+        {/* Print options */}
+        <div className="px-4 pt-2 pb-1 border-t border-bambu-dark-tertiary space-y-2">
+          <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+            {monochrome ? (
+              <CheckSquare className="w-4 h-4 text-bambu-green shrink-0" />
+            ) : (
+              <Square className="w-4 h-4 text-bambu-gray shrink-0" />
+            )}
+            <input
+              type="checkbox"
+              checked={monochrome}
+              onChange={(e) => setMonochrome(e.target.checked)}
+              className="sr-only"
+            />
+            <span className="text-sm text-white">
+              {t('inventory.labels.monochrome', 'Monochrome (black & white printer)')}
+            </span>
+            <span className="text-xs text-bambu-gray">
+              {t('inventory.labels.monochromeHint', 'Drops the colour swatch and widens the text')}
+            </span>
+          </label>
+          <div className="flex items-start gap-3">
+            <label
+              htmlFor="label-starting-position"
+              className="text-sm text-white whitespace-nowrap pt-1.5"
+            >
+              {t('inventory.labels.startingPosition', 'Starting label position')}
+            </label>
+            <input
+              id="label-starting-position"
+              data-testid="label-starting-position"
+              type="number"
+              min={1}
+              max={MAX_SHEET_CAPACITY}
+              step={1}
+              value={startingPositionInput}
+              onChange={(event) => setStartingPositionInput(event.target.value)}
+              aria-describedby="label-starting-position-help"
+              className="w-20 px-2 py-1 bg-bambu-dark border border-bambu-dark-tertiary rounded text-white text-sm focus:outline-none focus:border-bambu-green"
+            />
+            <div id="label-starting-position-help" className="text-xs text-bambu-gray pt-1.5">
+              <div>
+                {t(
+                  'inventory.labels.startingPositionRange',
+                  'Sheet templates only: L7160 supports 1–21; 5160 supports 1–30.',
+                )}
+              </div>
+              <div
+                data-testid="label-starting-position-status"
+                className={startingPositionIsValid ? '' : 'text-red-400'}
+              >
+                {!startingPositionIsValid
+                  ? t(
+                      'inventory.labels.startingPositionInvalid',
+                      'Enter a whole number from 1 to {{capacity}}.',
+                      { capacity: MAX_SHEET_CAPACITY },
+                    )
+                  : startingPosition === 1
+                    ? t('inventory.labels.startingPositionFirst', 'Printing starts at position 1.')
+                    : t(
+                        'inventory.labels.startingPositionSkipped',
+                        'Positions 1 through {{lastPosition}} will be left blank on the first sheet.',
+                        { lastPosition: startingPosition - 1 },
+                      )}
+              </div>
+            </div>
+          </div>
+        </div>
+
         {/* Templates — 2x2 grid on >= sm so all 4 plus the Cancel footer fit
             inside max-h-[90vh] even when browser chrome eats into the viewport
             (#1230). Stacked single column on mobile widths. */}
-        <div className="px-3 pt-2 pb-2 grid grid-cols-1 sm:grid-cols-2 gap-2 border-t border-bambu-dark-tertiary">
+        <div className="px-3 pt-1 pb-2 grid grid-cols-1 sm:grid-cols-2 gap-2">
           {TEMPLATE_OPTIONS.map((opt) => {
             const isPending = pending === opt.value;
+            const sheetCapacity = SHEET_CAPACITIES[opt.value];
+            const startingPositionExceedsSheet =
+              sheetCapacity !== undefined &&
+              (!startingPositionIsValid || startingPosition > sheetCapacity);
             const label = t(`inventory.labels.templates.${opt.i18nKey}.label`, opt.fallbackLabel);
-            const hint = t(`inventory.labels.templates.${opt.i18nKey}.hint`, opt.fallbackHint);
+            const hint = startingPositionExceedsSheet
+              ? t(
+                  'inventory.labels.startingPositionRangeError',
+                  'Starting position must be between 1 and {{capacity}} for this sheet.',
+                  { capacity: sheetCapacity },
+                )
+              : t(`inventory.labels.templates.${opt.i18nKey}.hint`, opt.fallbackHint);
             return (
               <button
                 key={opt.value}
-                disabled={noSelection || pending !== null}
+                data-testid={`print-labels-${opt.value}`}
+                disabled={noSelection || pending !== null || startingPositionExceedsSheet}
                 onClick={() => handlePick(opt.value)}
                 title={`${label} — ${hint}`}
                 className="w-full text-left p-2.5 rounded-lg border border-bambu-dark-tertiary bg-bambu-dark hover:border-bambu-green hover:bg-bambu-green/10 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:border-bambu-dark-tertiary disabled:hover:bg-bambu-dark transition flex items-center gap-3"

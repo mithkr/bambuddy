@@ -323,6 +323,111 @@ class TestFindOrCreateFilament:
         assert result == 7
 
     @pytest.mark.asyncio
+    async def test_color_name_does_not_trigger_filament_patch(self, client):
+        """#1357: Spoolman 0.23.1 has no `color_name` field on Filament
+        (verified against FilamentUpdateParameters schema). find_or_create_filament
+        must NOT attempt to PATCH it — the route now persists the user's
+        color_name to spool.extra.bambu_color_name instead. Any patch call
+        from this layer would be a silent no-op (Spoolman ignores unknown
+        keys) and was the original symptom of "edits never save".
+        """
+        existing = {**SAMPLE_FILAMENT}
+        with (
+            patch.object(client, "find_or_create_vendor", AsyncMock(return_value=3)),
+            patch.object(client, "get_filaments", AsyncMock(return_value=[existing])),
+            patch.object(client, "patch_filament", AsyncMock()) as mock_patch,
+        ):
+            result = await client.find_or_create_filament(
+                "PLA", "Basic", "Bambu Lab", "FF0000", 1000, color_name="Sunny Yellow"
+            )
+        assert result == 7
+        mock_patch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_matches_filament_named_with_just_subtype(self, client):
+        """#1357: AMS-sync auto-create saves the filament with name set to just
+        ``tray.tray_sub_brands`` (e.g. ``"Glow"`` without the material prefix),
+        but the user-driven edit path composes ``"<material> <subtype>"``
+        (``"PLA Glow"``). Before this fix the literal `f_name == name` check
+        failed to bridge the two shapes, so every edit fell through to
+        ``create_filament`` and left a trail of duplicate filaments. Now the
+        name match strips the material prefix on both sides, so the two
+        shapes resolve to the same subtype key."""
+        existing = {
+            **SAMPLE_FILAMENT,
+            "id": 11,
+            "name": "Glow",  # AMS-sync shape: just subtype
+            "material": "PLA",
+            "color_hex": "AAF3C6",
+            "color_name": None,
+            "vendor": {"id": 3, "name": "Amazon Basics"},
+        }
+        with (
+            patch.object(client, "find_or_create_vendor", AsyncMock(return_value=3)),
+            patch.object(client, "get_filaments", AsyncMock(return_value=[existing])),
+            patch.object(client, "patch_filament", AsyncMock()) as mock_patch,
+            patch.object(client, "create_filament", AsyncMock()) as mock_create,
+        ):
+            result = await client.find_or_create_filament(
+                "PLA", "Glow", "Amazon Basics", "AAF3C6", 1000, color_name="Bright Glow"
+            )
+        assert result == 11
+        # color_name is no longer written via the filament — see #1357 — and
+        # the function must not create a duplicate filament.
+        mock_patch.assert_not_called()
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_still_matches_filament_named_material_plus_subtype(self, client):
+        """The composed-name shape (``"PLA Basic"`` matching a Spoolman filament
+        also named ``"PLA Basic"``) must keep working — the normalisation strips
+        the prefix on both sides, so the comparison is on the subtype part."""
+        existing = {
+            **SAMPLE_FILAMENT,
+            "id": 7,
+            "name": "PLA Basic",
+            "material": "PLA",
+            "color_hex": "FF0000",
+            "color_name": "Sunset",
+        }
+        with (
+            patch.object(client, "find_or_create_vendor", AsyncMock(return_value=3)),
+            patch.object(client, "get_filaments", AsyncMock(return_value=[existing])),
+            patch.object(client, "patch_filament", AsyncMock(return_value={"id": 7})),
+            patch.object(client, "create_filament", AsyncMock()) as mock_create,
+        ):
+            result = await client.find_or_create_filament(
+                "PLA", "Basic", "Bambu Lab", "FF0000", 1000, color_name="Sunset"
+            )
+        assert result == 7
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_name_match_does_not_cross_materials(self, client):
+        """Sanity check: a filament with name=subtype must NOT match a request
+        with a different material that happens to share the subtype string.
+        material_match runs first and fails, so the iteration moves on and
+        ``create_filament`` is called."""
+        existing = {
+            **SAMPLE_FILAMENT,
+            "id": 7,
+            "name": "Basic",
+            "material": "PETG",  # different material
+            "color_hex": "FF0000",
+        }
+        new_filament = {"id": 99, "name": "PLA Basic"}
+        with (
+            patch.object(client, "find_or_create_vendor", AsyncMock(return_value=3)),
+            patch.object(client, "get_filaments", AsyncMock(return_value=[existing])),
+            patch.object(client, "create_filament", AsyncMock(return_value=new_filament)) as mock_create,
+        ):
+            result = await client.find_or_create_filament(
+                "PLA", "Basic", "Bambu Lab", "FF0000", 1000, color_name="Sunset"
+            )
+        assert result == 99
+        mock_create.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_creates_filament_when_no_match(self, client):
         new_filament = {"id": 99, "name": "PETG Pro"}
         with (
@@ -332,12 +437,15 @@ class TestFindOrCreateFilament:
         ):
             result = await client.find_or_create_filament("PETG", "Pro", "Bambu Lab", "00FF00", 1000)
         assert result == 99
+        # color_name is intentionally not forwarded to create_filament (#1357):
+        # Spoolman has no such field on Filament, so passing it would be a
+        # no-op. The route persists color_name to spool.extra.bambu_color_name
+        # after this returns.
         mock_create.assert_called_once_with(
             name="PETG Pro",
             vendor_id=3,
             material="PETG",
             color_hex="00FF00",
-            color_name=None,
             weight=1000.0,
         )
 
@@ -368,7 +476,6 @@ class TestFindOrCreateFilament:
             vendor_id=None,
             material="ABS",
             color_hex="FF0000",
-            color_name=None,
             weight=750.0,
         )
 
@@ -422,3 +529,139 @@ class TestGetExternalFilamentsRaisesOnError:
             pytest.raises(SpoolmanUnavailableError),
         ):
             await client.get_external_filaments()
+
+
+# ---------------------------------------------------------------------------
+# get_distinct_locations — shape normalisation (#1505 review BLOCKER 3)
+# ---------------------------------------------------------------------------
+
+
+class TestGetDistinctLocationsShape:
+    @pytest.mark.asyncio
+    async def test_passes_through_list_of_strings(self, client):
+        with patch.object(client, "_get_with_retry", AsyncMock(return_value=["Drybox 1", "Shelf"])):
+            result = await client.get_distinct_locations()
+        assert result == ["Drybox 1", "Shelf"]
+
+    @pytest.mark.asyncio
+    async def test_extracts_name_from_list_of_dicts(self, client):
+        with patch.object(
+            client,
+            "_get_with_retry",
+            AsyncMock(return_value=[{"id": 1, "name": "Drybox 1"}, {"id": 2, "name": "Shelf"}]),
+        ):
+            result = await client.get_distinct_locations()
+        assert result == ["Drybox 1", "Shelf"]
+
+    @pytest.mark.asyncio
+    async def test_drops_non_string_and_dict_without_name(self, client):
+        with patch.object(
+            client,
+            "_get_with_retry",
+            AsyncMock(return_value=[{"id": 1}, None, 42, "Shelf"]),
+        ):
+            result = await client.get_distinct_locations()
+        assert result == ["Shelf"]
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_on_non_list_payload(self, client):
+        # A misconfigured proxy or auth-redirect can serve HTML; the old shape
+        # would TypeError on iteration. We coerce to [].
+        with patch.object(client, "_get_with_retry", AsyncMock(return_value={"error": "unauthorized"})):
+            result = await client.get_distinct_locations()
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# rename_location — bulk endpoint + per-spool fallback (#1505 review BLOCKER 2)
+# ---------------------------------------------------------------------------
+
+
+class TestRenameLocationBulkAndFallback:
+    @pytest.mark.asyncio
+    async def test_bulk_endpoint_success_returns_zero(self, client):
+        """Modern Spoolman PATCH /location/{name} succeeds — fallback not used."""
+        mock_http = AsyncMock()
+        mock_http.patch = AsyncMock(return_value=_make_response(None))
+        with patch.object(client, "_get_client", AsyncMock(return_value=mock_http)):
+            result = await client.rename_location("Drybox 1", "Drybox 2")
+        assert result == 0
+        # Confirm the bulk path was used (no per-spool PATCH).
+        mock_http.patch.assert_called_once()
+        assert "/location/" in mock_http.patch.call_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_bulk_endpoint_404_falls_back_to_per_spool_patch(self, client):
+        """Older Spoolman versions return 404 on the bulk endpoint — the
+        fallback iterates every spool currently at the old name."""
+        bulk_response = MagicMock()
+        bulk_response.status_code = 404
+        bulk_response.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError("404 Not Found", request=MagicMock(), response=MagicMock(status_code=404))
+        )
+        mock_http = AsyncMock()
+        mock_http.patch = AsyncMock(return_value=bulk_response)
+
+        spools_at_old = [
+            {"id": 11, "location": "Drybox 1"},
+            {"id": 12, "location": "Drybox 1"},
+            {"id": 13, "location": "Shelf A"},  # different location — must be skipped
+        ]
+        patch_response = MagicMock()
+        patch_response.status_code = 200
+        patch_response.raise_for_status = MagicMock()
+        patch_response.json.return_value = {"id": 0, "location": "Drybox 2"}
+
+        with (
+            patch.object(client, "_get_client", AsyncMock(return_value=mock_http)),
+            patch.object(client, "get_all_spools", AsyncMock(return_value=spools_at_old)),
+            patch.object(client, "_request_spool", AsyncMock(return_value=patch_response)) as request_spool_mock,
+        ):
+            result = await client.rename_location("Drybox 1", "Drybox 2")
+
+        assert result == 2
+        # Only the two matching spools should be PATCHed.
+        assert request_spool_mock.await_count == 2
+        called_ids = sorted(call.args[1] for call in request_spool_mock.await_args_list)
+        assert called_ids == [11, 12]
+        # And each call should set the new location string.
+        for call in request_spool_mock.await_args_list:
+            assert call.kwargs["json_body"] == {"location": "Drybox 2"}
+
+    @pytest.mark.asyncio
+    async def test_bulk_endpoint_405_also_falls_back(self, client):
+        """Some Spoolman versions return 405 Method Not Allowed instead of 404
+        when the bulk endpoint is missing — same fallback."""
+        bulk_response = MagicMock()
+        bulk_response.status_code = 405
+        bulk_response.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError(
+                "405 Method Not Allowed", request=MagicMock(), response=MagicMock(status_code=405)
+            )
+        )
+        mock_http = AsyncMock()
+        mock_http.patch = AsyncMock(return_value=bulk_response)
+
+        with (
+            patch.object(client, "_get_client", AsyncMock(return_value=mock_http)),
+            patch.object(client, "get_all_spools", AsyncMock(return_value=[])),
+        ):
+            result = await client.rename_location("Drybox 1", "Drybox 2")
+        # No spools at the old name → nothing to do, fallback returns 0.
+        assert result == 0
+
+    @pytest.mark.asyncio
+    async def test_bulk_endpoint_non_404_5xx_propagates(self, client):
+        """A genuine server error must NOT silently fall back."""
+        bulk_response = MagicMock()
+        bulk_response.status_code = 500
+        bulk_response.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError("500", request=MagicMock(), response=MagicMock(status_code=500))
+        )
+        mock_http = AsyncMock()
+        mock_http.patch = AsyncMock(return_value=bulk_response)
+        with (
+            patch.object(client, "_get_client", AsyncMock(return_value=mock_http)),
+            pytest.raises(httpx.HTTPStatusError),
+        ):
+            await client.rename_location("Drybox 1", "Drybox 2")

@@ -12,6 +12,8 @@ from backend.app.api.routes.settings import get_external_login_url
 from backend.app.core.auth import (
     ALGORITHM,
     SECRET_KEY,
+    RequireAdminIfAuthEnabled,
+    RequireAnyPermissionIfAuthEnabled,
     RequirePermissionIfAuthEnabled,
     get_current_user_optional,
     get_password_hash,
@@ -25,16 +27,29 @@ from backend.app.models.api_key import APIKey
 from backend.app.models.archive import PrintArchive
 from backend.app.models.group import Group
 from backend.app.models.library import LibraryFile
+from backend.app.models.long_lived_token import LongLivedToken
+from backend.app.models.oidc_provider import UserOIDCLink
+from backend.app.models.print_batch import PrintBatch
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.settings import Settings
 from backend.app.models.user import User
-from backend.app.schemas.auth import ChangePasswordRequest, GroupBrief, UserCreate, UserResponse, UserUpdate
+from backend.app.models.user_otp_code import UserOTPCode
+from backend.app.models.user_totp import UserTOTP
+from backend.app.schemas.auth import (
+    ChangePasswordRequest,
+    GroupBrief,
+    UserCreate,
+    UserResponse,
+    UserSlim,
+    UserUpdate,
+)
 from backend.app.services.email_service import (
     create_welcome_email_from_template,
     generate_secure_password,
     get_smtp_settings,
     send_email,
 )
+from backend.app.services.finance_defaults import ensure_user_finance_defaults
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -61,7 +76,13 @@ async def list_users(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.USERS_READ),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all users."""
+    """List all users.
+
+    Read-only — gated on ``USERS_READ`` only. Operator-visible UIs
+    (Stats filter-by-user, Archives Print Log username column, File
+    Manager username autocomplete) consume this endpoint via custom-
+    group ``users:read`` grants without admin role. The admin-only
+    boundary lives on the write endpoints below."""
     result = await db.execute(select(User).options(selectinload(User.groups)).order_by(User.created_at))
     users = result.scalars().all()
     return [_user_to_response(user) for user in users]
@@ -71,6 +92,7 @@ async def list_users(
 @router.post("/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(
     user_data: UserCreate,
+    _admin: User | None = RequireAdminIfAuthEnabled(),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.USERS_CREATE),
     db: AsyncSession = Depends(get_db),
 ):
@@ -151,6 +173,8 @@ async def create_user(
         new_user.groups = list(groups)
 
     db.add(new_user)
+    await db.flush()
+    await ensure_user_finance_defaults(db, new_user)
     await db.commit()
     await db.refresh(new_user)
 
@@ -174,13 +198,38 @@ async def create_user(
     return _user_to_response(new_user)
 
 
+@router.get("/slim", response_model=list[UserSlim])
+async def list_users_slim(
+    _: User | None = RequireAnyPermissionIfAuthEnabled(Permission.USERS_READ_SLIM, Permission.USERS_READ),
+    db: AsyncSession = Depends(get_db),
+):
+    """List users as ``{id, username}`` only (#1894).
+
+    Exists so an API key -- or a group that should not see emails, roles and
+    permission sets -- can turn the ``created_by_id`` values it already gets
+    back from archives, stats and the queue into names.
+
+    ``USERS_READ`` is accepted alongside ``USERS_READ_SLIM`` because it is
+    strictly broader; groups that already hold it keep working without a
+    permission backfill. For API keys only the slim permission resolves (the
+    full one is unmapped = administrative), so a key reaches this and not the
+    listing above.
+
+    Declared before ``/{user_id}`` on purpose: FastAPI matches in declaration
+    order, and the reverse order would parse "slim" as the int path parameter
+    and answer 422.
+    """
+    result = await db.execute(select(User.id, User.username).order_by(User.username))
+    return [UserSlim(id=row.id, username=row.username) for row in result.all()]
+
+
 @router.get("/{user_id}", response_model=UserResponse)
 async def get_user(
     user_id: int,
     _: User | None = RequirePermissionIfAuthEnabled(Permission.USERS_READ),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get a user by ID."""
+    """Get a user by ID. Read-only — gated on ``USERS_READ`` only."""
     result = await db.execute(select(User).where(User.id == user_id).options(selectinload(User.groups)))
     user = result.scalar_one_or_none()
     if not user:
@@ -196,6 +245,7 @@ async def get_user(
 async def update_user(
     user_id: int,
     user_data: UserUpdate,
+    _admin: User | None = RequireAdminIfAuthEnabled(),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.USERS_UPDATE),
     db: AsyncSession = Depends(get_db),
 ):
@@ -293,6 +343,8 @@ async def update_user(
             )
         user.groups = list(groups)
 
+    await ensure_user_finance_defaults(db, user)
+
     await db.commit()
     result = await db.execute(select(User).where(User.id == user_id).options(selectinload(User.groups)))
     user = result.scalar_one()
@@ -306,7 +358,8 @@ async def get_user_items_count(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.USERS_READ),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get count of items created by this user."""
+    """Get count of items created by this user. Read-only — gated on
+    ``USERS_READ`` only."""
     # Verify user exists
     result = await db.execute(select(User).where(User.id == user_id))
     if not result.scalar_one_or_none():
@@ -345,6 +398,7 @@ async def get_user_items_count(
 async def delete_user(
     user_id: int,
     delete_items: bool = Query(False, description="Delete all items created by this user"),
+    _admin: User | None = RequireAdminIfAuthEnabled(),
     current_user: User | None = RequirePermissionIfAuthEnabled(Permission.USERS_DELETE),
     db: AsyncSession = Depends(get_db),
 ):
@@ -395,9 +449,12 @@ async def delete_user(
         await db.execute(delete(PrintArchive).where(PrintArchive.created_by_id == user_id))
         await db.execute(delete(PrintQueueItem).where(PrintQueueItem.created_by_id == user_id))
         await db.execute(delete(LibraryFile).where(LibraryFile.created_by_id == user_id))
+        await db.execute(delete(PrintBatch).where(PrintBatch.created_by_id == user_id))
     else:
         # Explicitly set created_by_id to NULL for all items (ensures consistent behavior
-        # across different database backends, including SQLite without foreign key support)
+        # across different database backends, including SQLite without foreign key support).
+        # PrintBatch carries the same created_by_id FK with ondelete=SET NULL — admin-deleted
+        # users would otherwise leave dangling created_by_id on SQLite (#1295 review nit).
         from sqlalchemy import update
 
         await db.execute(update(PrintArchive).where(PrintArchive.created_by_id == user_id).values(created_by_id=None))
@@ -405,6 +462,7 @@ async def delete_user(
             update(PrintQueueItem).where(PrintQueueItem.created_by_id == user_id).values(created_by_id=None)
         )
         await db.execute(update(LibraryFile).where(LibraryFile.created_by_id == user_id).values(created_by_id=None))
+        await db.execute(update(PrintBatch).where(PrintBatch.created_by_id == user_id).values(created_by_id=None))
 
     # Drop API keys owned by this user. The model declares ON DELETE CASCADE
     # so Postgres handles this automatically, but SQLite ships with FK
@@ -416,6 +474,22 @@ async def delete_user(
     # /cloud/* — but the rest of the API would still accept them, which is
     # exactly the orphan-key state the CASCADE was meant to prevent).
     await db.execute(delete(APIKey).where(APIKey.user_id == user_id))
+
+    # Drop OIDC links, MFA state, and long-lived camera-stream tokens
+    # owned by this user. Same SQLite/FK pattern as APIKey above. Without
+    # these, deleting a user on SQLite leaves:
+    #   - UserOIDCLink: the OIDC callback finds the orphan link, fails to
+    #     resolve the (now missing) user, and falls through to
+    #     "account_inactive" instead of triggering auto_create (#1285).
+    #   - UserTOTP: MFA secrets persist in the DB after the owning user.
+    #   - UserOTPCode: pending email OTP codes linger.
+    #   - LongLivedToken: per-user camera-stream tokens whose secret_hash
+    #     is still valid — verify() would happily match them by lookup
+    #     prefix even though the user is gone.
+    await db.execute(delete(UserOIDCLink).where(UserOIDCLink.user_id == user_id))
+    await db.execute(delete(UserTOTP).where(UserTOTP.user_id == user_id))
+    await db.execute(delete(UserOTPCode).where(UserOTPCode.user_id == user_id))
+    await db.execute(delete(LongLivedToken).where(LongLivedToken.user_id == user_id))
 
     await db.delete(user)
     await db.commit()

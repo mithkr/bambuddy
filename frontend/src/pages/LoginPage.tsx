@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { useTheme } from '../contexts/ThemeContext';
 import { X, Mail, Shield, Smartphone, Key } from 'lucide-react';
-import { api, type LoginResponse, type TokenPersistence } from '../api/client';
+import { api, type LoginResponse, type OIDCProvider, type TokenPersistence } from '../api/client';
 import { Card, CardHeader, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
 
@@ -16,6 +16,7 @@ type LoginStep = 'credentials' | '2fa' | 'reset-password';
 // Read + remove in one try so all branches in the OIDC useEffect see the same
 // value and a subsequent page load does not replay the flag.
 const REMEMBER_ME_KEY = 'auth_remember_me';
+const POST_LOGIN_REDIRECT_KEY = 'auth_post_login_redirect';
 
 function toPersistence(remember: boolean): TokenPersistence {
   return remember ? 'persistent' : 'session';
@@ -32,13 +33,103 @@ function consumeSavedRememberMe(): boolean {
   }
 }
 
+// Only accept same-origin internal paths. Rejects protocol-relative (`//evil.com`),
+// absolute URLs, and the login page itself (would loop). Anything else falls
+// back to `/` so a tampered sessionStorage entry can't open-redirect.
+function sanitizeRedirectTarget(target: string | null | undefined): string | null {
+  if (!target) return null;
+  if (!target.startsWith('/')) return null;
+  if (target.startsWith('//')) return null;
+  if (target.startsWith('/login')) return null;
+  return target;
+}
+
+function stashPostLoginRedirect(target: string): void {
+  const safe = sanitizeRedirectTarget(target);
+  if (!safe) return;
+  try {
+    sessionStorage.setItem(POST_LOGIN_REDIRECT_KEY, safe);
+  } catch (err) {
+    console.warn('stashPostLoginRedirect: sessionStorage unavailable, post-login target will be lost across OIDC redirect', err);
+  }
+}
+
+function consumePostLoginRedirect(): string | null {
+  try {
+    const saved = sessionStorage.getItem(POST_LOGIN_REDIRECT_KEY);
+    sessionStorage.removeItem(POST_LOGIN_REDIRECT_KEY);
+    return sanitizeRedirectTarget(saved);
+  } catch (err) {
+    console.warn('consumePostLoginRedirect: sessionStorage unavailable', err);
+    return null;
+  }
+}
+
+/**
+ * Single OIDC-provider login button. Extracted from the `.map()` body
+ * because hooks can't be used inside a loop callback — the `iconFailed`
+ * state is per-provider and must live in its own component instance.
+ *
+ * On `<img>` load failure (provider deleted between page load and image
+ * fetch, network blip, etc.) we flip to the Shield fallback rather than
+ * showing the browser's broken-image glyph to anonymous users (#1333 review).
+ */
+function OIDCProviderButton({
+  provider,
+  onClick,
+  disabled,
+}: {
+  provider: OIDCProvider;
+  onClick: () => void;
+  disabled: boolean;
+}) {
+  const { t } = useTranslation();
+  const [iconFailed, setIconFailed] = useState(false);
+  const showIcon = provider.has_icon && !iconFailed;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="w-full flex items-center justify-center gap-3 py-3 px-4 bg-bambu-dark-secondary border border-bambu-dark-tertiary hover:border-bambu-green/50 rounded-lg text-white font-medium transition-colors disabled:opacity-50"
+    >
+      {showIcon ? (
+        <img
+          src={api.oidcProviderIconUrl(provider.id)}
+          alt=""
+          className="w-5 h-5 object-contain"
+          onError={() => setIconFailed(true)}
+        />
+      ) : (
+        <Shield className="w-5 h-5 text-bambu-green" />
+      )}
+      {t('login.twoFA.signInWith', { provider: provider.name })}
+    </button>
+  );
+}
+
 export function LoginPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const [searchParams] = useSearchParams();
   const { t } = useTranslation();
-  const { login, loginWithToken } = useAuth();
+  const { login, loginWithToken, user, loading } = useAuth();
   const { showToast } = useToast();
   const { mode } = useTheme();
+
+  // Resolve the post-login destination, preferring router state (set by
+  // ProtectedRoute when it redirects an unauthed visit) over the sessionStorage
+  // stash (used to survive the OIDC provider round-trip, which kills React
+  // state). Falls back to `/` and rejects unsafe targets via sanitize.
+  function resolvePostLoginRedirect(): string {
+    const fromState = (location.state as { from?: { pathname?: string; search?: string } } | null)?.from;
+    if (fromState?.pathname) {
+      const target = `${fromState.pathname}${fromState.search ?? ''}`;
+      const safe = sanitizeRedirectTarget(target);
+      if (safe) return safe;
+    }
+    return consumePostLoginRedirect() ?? '/';
+  }
 
   // Credentials step state
   const [username, setUsername] = useState('');
@@ -73,6 +164,58 @@ export function LoginPage() {
     queryKey: ['oidcProviders'],
     queryFn: () => api.getOIDCProviders(),
   });
+
+  // #1589: autologin redirect with fallback. When the backend reports an
+  // `autologin_provider_id`, redirect unauthenticated visitors directly to
+  // that provider's authorize URL on mount — unless the URL carries
+  // `?fallback=local` (the documented recovery path that pairs with the
+  // server-side BAMBUDDY_LOCAL_LOGIN env-var bypass). The authorize-URL
+  // fetch is raced against a 5-second timeout; on timeout or fetch error
+  // we skip the redirect and render the normal page, surfacing a banner
+  // so the user understands why autologin didn't kick in.
+  const [autologinFailed, setAutologinFailed] = useState(false);
+
+  // #1889: redirect already-authenticated visitors away from /login. Without
+  // this, a valid session that lands directly on /login (e.g. the browser
+  // address bar autocompletes the origin to its most-visited path) renders the
+  // credentials form even though the token is live and every request succeeds —
+  // making Bambuddy look like it "never stays logged in". Gate on the
+  // credentials step so we don't interrupt the 2FA / OIDC-callback branches,
+  // which navigate themselves after loginWithToken. Send to '/' rather than
+  // resolvePostLoginRedirect() to avoid consuming the OIDC redirect stash: an
+  // already-authed direct visit has no pending redirect to honour.
+  useEffect(() => {
+    if (!loading && user && step === 'credentials') {
+      navigate('/', { replace: true });
+    }
+  }, [loading, user, step, navigate]);
+
+  const autologinAttemptedRef = useRef(false);
+  useEffect(() => {
+    if (autologinAttemptedRef.current) return;
+    const fallbackQuery = searchParams.get('fallback');
+    if (fallbackQuery === 'local') return;
+    if (!advancedAuthStatus || !advancedAuthStatus.autologin_provider_id) return;
+    // Don't redirect mid-OIDC-exchange (we're already coming back from the IdP).
+    const hash = window.location.hash;
+    if (hash.startsWith('#oidc_token=') || searchParams.get('oidc_error')) return;
+    autologinAttemptedRef.current = true;
+
+    const providerId = advancedAuthStatus.autologin_provider_id;
+    const timeoutPromise = new Promise<never>((_resolve, reject) =>
+      setTimeout(() => reject(new Error('autologin timeout')), 5000),
+    );
+    Promise.race([api.getOIDCAuthorizeUrl(providerId), timeoutPromise])
+      .then((result) => {
+        window.location.href = (result as { auth_url: string }).auth_url;
+      })
+      .catch(() => {
+        setAutologinFailed(true);
+      });
+  }, [advancedAuthStatus, searchParams]);
+
+  const localLoginEnabled = advancedAuthStatus?.local_login_enabled !== false;
+  const showAutologinBanner = autologinFailed && advancedAuthStatus?.autologin_provider_id != null;
 
   // M-B: Detect #reset_token=... in the URL fragment and switch to the reset step.
   // Fragments are never sent to the server so the token never appears in access-logs
@@ -147,7 +290,7 @@ export function LoginPage() {
         } else if (resp.access_token && resp.user) {
           loginWithToken(resp.access_token, resp.user, toPersistence(savedRememberMe));
           showToast(t('login.loginSuccess'));
-          navigate('/', { replace: true });
+          navigate(resolvePostLoginRedirect(), { replace: true });
         } else {
           showToast(t('login.oidcLoginFailed'), 'error');
           navigate('/login', { replace: true });
@@ -176,7 +319,7 @@ export function LoginPage() {
         setStep('2fa');
       } else if (resp.access_token && resp.user) {
         showToast(t('login.loginSuccess'));
-        navigate('/');
+        navigate(resolvePostLoginRedirect(), { replace: true });
       }
     },
     onError: (error: Error) => {
@@ -232,7 +375,7 @@ export function LoginPage() {
       if (resp.access_token && resp.user) {
         loginWithToken(resp.access_token, resp.user, toPersistence(rememberMe));
         showToast(t('login.loginSuccess'));
-        navigate('/');
+        navigate(resolvePostLoginRedirect(), { replace: true });
       } else {
         console.error('2FA verify: unexpected response shape', resp);
         showToast(t('login.loginFailed'), 'error');
@@ -254,6 +397,13 @@ export function LoginPage() {
         } catch (err) {
           console.warn('setItem auth_remember_me failed, Remember Me will not carry through OIDC redirect', err);
         }
+      }
+      // Stash the post-login destination from router state so it survives the
+      // provider round-trip (window.location.href kills React state). If the
+      // user landed on /login directly, fromState is absent and we don't stash.
+      const fromState = (location.state as { from?: { pathname?: string; search?: string } } | null)?.from;
+      if (fromState?.pathname) {
+        stashPostLoginRedirect(`${fromState.pathname}${fromState.search ?? ''}`);
       }
       window.location.href = data.auth_url;
     },
@@ -569,6 +719,19 @@ export function LoginPage() {
           </p>
         </div>
 
+        {showAutologinBanner && (
+          <div className="mt-6 rounded-lg border border-amber-300 dark:border-amber-500/40 bg-amber-50 dark:bg-amber-500/10 px-4 py-3 text-sm text-amber-800 dark:text-amber-200">
+            {t('login.autologinFailed')}
+          </div>
+        )}
+
+        {!localLoginEnabled && (
+          <div className="mt-6 rounded-lg border border-bambu-dark-tertiary bg-bambu-dark/40 px-4 py-3 text-sm text-bambu-gray">
+            {t('login.localDisabledNotice')}
+          </div>
+        )}
+
+        {localLoginEnabled && (
         <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
           <div className="space-y-4">
             <div>
@@ -641,6 +804,7 @@ export function LoginPage() {
             </button>
           </div>
         </form>
+        )}
 
         {/* OIDC provider buttons */}
         {oidcProviders && oidcProviders.length > 0 && (
@@ -656,20 +820,12 @@ export function LoginPage() {
 
             <div className="space-y-2">
               {oidcProviders.map((provider) => (
-                <button
+                <OIDCProviderButton
                   key={provider.id}
-                  type="button"
+                  provider={provider}
                   onClick={() => oidcLoginMutation.mutate(provider.id)}
                   disabled={oidcLoginMutation.isPending}
-                  className="w-full flex items-center justify-center gap-3 py-3 px-4 bg-bambu-dark-secondary border border-bambu-dark-tertiary hover:border-bambu-green/50 rounded-lg text-white font-medium transition-colors disabled:opacity-50"
-                >
-                  {provider.icon_url ? (
-                    <img src={provider.icon_url} alt="" className="w-5 h-5 object-contain" />
-                  ) : (
-                    <Shield className="w-5 h-5 text-bambu-green" />
-                  )}
-                  {t('login.twoFA.signInWith', { provider: provider.name })}
-                </button>
+                />
               ))}
             </div>
           </div>

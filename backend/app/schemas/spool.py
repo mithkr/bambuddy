@@ -100,6 +100,11 @@ class SpoolBase(BaseModel):
     core_weight: int = 250
     core_weight_catalog_id: int | None = None
     weight_used: float = 0
+    # Anchor for the resettable "Total Consumed" display. The Inventory
+    # page shows `weight_used - weight_used_baseline`; the per-spool /
+    # bulk "Reset usage to 0" action sets baseline = weight_used so the
+    # counter zeroes without touching remaining (#1390).
+    weight_used_baseline: float = 0
     slicer_filament: str | None = None
     slicer_filament_name: str | None = None
     nozzle_temp_min: int | None = None
@@ -116,6 +121,11 @@ class SpoolBase(BaseModel):
     # User-defined category + per-spool low-stock threshold override (#729).
     category: str | None = Field(default=None, max_length=50)
     low_stock_threshold_pct: int | None = Field(default=None, ge=1, le=99)
+    # Free-text storage location, distinct from `location` (AMS slot
+    # assignment). Column has lived on the ORM since the inventory rework
+    # but was missing from this schema, so writes were silently dropped (#1291).
+    storage_location: str | None = Field(default=None, max_length=255)
+    location_id: int | None = Field(default=None, gt=0)
 
 
 class SpoolCreate(SpoolBase):
@@ -164,6 +174,8 @@ class SpoolUpdate(BaseModel):
     # User-defined category + per-spool low-stock threshold override (#729).
     category: str | None = Field(default=None, max_length=50)
     low_stock_threshold_pct: int | None = Field(default=None, ge=1, le=99)
+    storage_location: str | None = Field(default=None, max_length=255)
+    location_id: int | None = Field(default=None, gt=0)
 
 
 class SpoolKProfileBase(BaseModel):
@@ -178,6 +190,31 @@ class SpoolKProfileBase(BaseModel):
 
 
 class SpoolKProfileResponse(SpoolKProfileBase):
+    id: int
+    spool_id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SpoolFilamentPresetBase(BaseModel):
+    """One per-printer-model slicer preset override for a spool.
+
+    ``nozzle_diameter`` defaults to "" meaning "any nozzle of this model". The
+    spool form always sends a concrete size; the empty form is for API clients
+    that want one value to cover a model. Lengths match the columns, which are wider than
+    ``Spool.slicer_filament`` so a preset id that fits the Spoolman write
+    schema cannot truncate on the way in.
+    """
+
+    printer_model: str = Field(..., min_length=1, max_length=50)
+    nozzle_diameter: str = Field(default="", max_length=10)
+    slicer_filament: str | None = Field(default=None, max_length=128)
+    slicer_filament_name: str | None = Field(default=None, max_length=255)
+
+
+class SpoolFilamentPresetResponse(SpoolFilamentPresetBase):
     id: int
     spool_id: int
     created_at: datetime

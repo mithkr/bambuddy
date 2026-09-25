@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor, fireEvent } from '@testing-library/react';
+import { screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { render } from '../utils';
+import { setColorCatalog, __resetColorCatalogForTests } from '../../utils/colors';
 import { LabelTemplatePickerModal } from '../../components/LabelTemplatePickerModal';
 import { api } from '../../api/client';
 
@@ -37,6 +38,47 @@ beforeEach(() => {
   vi.spyOn(window, 'open').mockImplementation(() => ({}) as Window);
 });
 
+describe('a colour name that only the catalog knows (#3090)', () => {
+  // The list labels a spool by its colour, and most Bambu spools carry no
+  // colour name — the name comes from resolving the swatch's hex against the
+  // catalog, which is fetched once at startup. The filter that builds this
+  // list is memoised, so it has to be told the catalog arrived; otherwise a
+  // search typed first keeps the empty result it computed without one.
+  const nameless = [{ id: 9, material: 'PLA', subtype: 'Silk+', brand: 'Bambu Lab', color_name: null, rgba: 'D02727FF' }];
+
+  beforeEach(() => {
+    __resetColorCatalogForTests();
+  });
+
+  const openModal = () =>
+    render(
+      <LabelTemplatePickerModal
+        isOpen
+        onClose={vi.fn()}
+        availableSpools={nameless}
+        initialSelectedIds={[]}
+        spoolmanMode={false}
+      />,
+    );
+
+  it('labels the spool from the catalog instead of falling back to its material', () => {
+    setColorCatalog({ d02727: 'Candy Red' });
+    openModal();
+
+    expect(screen.getByText(/Candy Red/)).toBeInTheDocument();
+  });
+
+  it('re-filters when the catalog arrives after the query was typed', async () => {
+    openModal();
+    fireEvent.change(screen.getByPlaceholderText(/Search/i), { target: { value: 'candy' } });
+    expect(screen.queryByText(/Candy Red/)).not.toBeInTheDocument();
+
+    setColorCatalog({ d02727: 'Candy Red' });
+
+    await waitFor(() => expect(screen.getByText(/Candy Red/)).toBeInTheDocument());
+  });
+});
+
 describe('LabelTemplatePickerModal', () => {
   it('does not render when closed', () => {
     render(
@@ -65,6 +107,22 @@ describe('LabelTemplatePickerModal', () => {
     expect(screen.getByText(/Blue · Sunlu/)).toBeInTheDocument();
     expect(screen.getByText(/Black/)).toBeInTheDocument();
     expect(screen.getByText(/Ivory · Polymaker/)).toBeInTheDocument();
+  });
+
+  it('keeps the panel from becoming a programmatically scrollable clipping container', () => {
+    render(
+      <LabelTemplatePickerModal
+        isOpen={true}
+        onClose={vi.fn()}
+        availableSpools={SPOOLS}
+        initialSelectedIds={[1, 2, 3, 4]}
+        spoolmanMode={false}
+      />,
+    );
+
+    const panel = screen.getByTestId('label-template-picker-panel');
+    expect(panel).toHaveClass('overflow-clip');
+    expect(panel).not.toHaveClass('overflow-hidden');
   });
 
   it('shows the live selected count in the header', () => {
@@ -176,7 +234,13 @@ describe('LabelTemplatePickerModal', () => {
         spoolmanMode={false}
       />,
     );
-    expect(screen.getByText(/AMS holder/i).closest('button')).toBeDisabled();
+    // Two AMS holder variants exist (#1426). Both must be disabled when no
+    // spools are selected — the empty-selection guard is global, not per-template.
+    const amsButtons = screen.getAllByText(/AMS holder/i).map((el) => el.closest('button'));
+    expect(amsButtons).toHaveLength(2);
+    for (const btn of amsButtons) {
+      expect(btn).toBeDisabled();
+    }
   });
 
   it('sends only the currently checked IDs to the local endpoint', async () => {
@@ -201,6 +265,8 @@ describe('LabelTemplatePickerModal', () => {
       expect(api.printSpoolLabels).toHaveBeenCalledWith({
         spool_ids: [1, 3],
         template: 'box_62x29',
+        monochrome: false,
+        starting_position: 1,
       });
     });
     await waitFor(() => expect(onClose).toHaveBeenCalled());
@@ -218,12 +284,16 @@ describe('LabelTemplatePickerModal', () => {
       />,
     );
 
-    fireEvent.click(screen.getByText(/AMS holder/i));
+    // Pick the larger AMS holder variant explicitly (#1426: two AMS templates
+     // exist now — pin which one the test sends so the assertion stays meaningful).
+    fireEvent.click(screen.getByText(/AMS holder — large \(75 × 55 mm\)/i));
 
     await waitFor(() => {
       expect(api.printSpoolmanSpoolLabels).toHaveBeenCalledWith({
         spool_ids: [1],
-        template: 'ams_30x15',
+        template: 'ams_holder_75x55',
+        monochrome: false,
+        starting_position: 1,
       });
     });
     expect(api.printSpoolLabels).not.toHaveBeenCalled();
@@ -296,9 +366,10 @@ describe('LabelTemplatePickerModal', () => {
       />,
     );
 
-    // All five templates must be in the DOM. Use the dimension suffix to
-    // disambiguate the two "Box label …" entries.
-    expect(screen.getByText(/AMS holder/i)).toBeInTheDocument();
+    // All six templates must be in the DOM (#1426 added two AMS variants).
+    // Use the dimension suffix to disambiguate same-family entries.
+    expect(screen.getByText(/AMS holder — small \(74 × 33 mm\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/AMS holder — large \(75 × 55 mm\)/i)).toBeInTheDocument();
     expect(screen.getByText(/Box label \(40 × 30 mm\)/i)).toBeInTheDocument();
     expect(screen.getByText(/Box label \(62 × 29 mm\)/i)).toBeInTheDocument();
     expect(screen.getByText(/Avery L7160/i)).toBeInTheDocument();
@@ -311,12 +382,162 @@ describe('LabelTemplatePickerModal', () => {
     const templatesSection = container.querySelector('div.grid.sm\\:grid-cols-2');
     expect(templatesSection).not.toBeNull();
     expect(templatesSection!.className).toContain('grid-cols-1');
-    expect(templatesSection!.querySelectorAll('button').length).toBe(5);
+    expect(templatesSection!.querySelectorAll('button').length).toBe(6);
 
     // Spool list still uses min-h-0 so it can yield further on very tight viewports.
     const spoolListScroller = container.querySelector('div.flex-1.overflow-y-auto');
     expect(spoolListScroller).not.toBeNull();
     expect(spoolListScroller!.className).toContain('min-h-0');
     expect(spoolListScroller!.className).not.toMatch(/min-h-\[\d/);
+  });
+
+  // #1410: an "ID | colour" sort toggle in the modal must flow through to the
+  // PDF — the backend (labels.py) prints in the order it receives spool_ids,
+  // so the modal's "submit in ID order" default was forcing every PDF to
+  // appear in spool-number order regardless of user choice. Toggling to
+  // colour mode must reorder both the visible list AND the payload so the
+  // printed sheet groups colours together.
+  it('sorts the submit payload by HSL hue when sort mode is "By colour" (#1410)', async () => {
+    vi.mocked(api.printSpoolLabels).mockResolvedValue(PDF_BLOB);
+    render(
+      <LabelTemplatePickerModal
+        isOpen={true}
+        onClose={vi.fn()}
+        availableSpools={SPOOLS}
+        initialSelectedIds={[1, 2, 3, 4]}  // Red / Blue / Black / Ivory all picked
+        spoolmanMode={false}
+      />,
+    );
+
+    // Default is ID-sorted; flip to colour.
+    fireEvent.click(screen.getByRole('button', { name: 'By colour' }));
+    fireEvent.click(screen.getByText(/Box label \(62 × 29 mm\)/i));
+
+    await waitFor(() => {
+      // Expected colour-sort order for the SPOOLS fixture:
+      //   Red    (1) — hue 0°   — chromatic
+      //   Ivory  (4) — hue ≈34° — chromatic
+      //   Blue   (2) — hue 240° — chromatic
+      //   Black  (3) — saturation ≈0 → neutrals bucket, lightness 0 → last
+      // Rainbow first, then neutrals (dark→light) per design choice for #1410.
+      expect(api.printSpoolLabels).toHaveBeenCalledWith({
+        spool_ids: [1, 4, 2, 3],
+        template: 'box_62x29',
+        monochrome: false,
+        starting_position: 1,
+      });
+    });
+  });
+
+  it('keeps ID-order submission by default (#1410 regression guard)', async () => {
+    // Adding the sort toggle must NOT change the default behaviour — IDs go
+    // in ascending order unless the user explicitly clicks "By colour".
+    vi.mocked(api.printSpoolLabels).mockResolvedValue(PDF_BLOB);
+    render(
+      <LabelTemplatePickerModal
+        isOpen={true}
+        onClose={vi.fn()}
+        availableSpools={SPOOLS}
+        initialSelectedIds={[1, 2, 3, 4]}
+        spoolmanMode={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByText(/Box label \(40 × 30 mm\)/i));
+
+    await waitFor(() => {
+      expect(api.printSpoolLabels).toHaveBeenCalledWith({
+        spool_ids: [1, 2, 3, 4],
+        template: 'box_40x30',
+        monochrome: false,
+        starting_position: 1,
+      });
+    });
+  });
+
+  it('sends monochrome:true when the black & white checkbox is ticked (#1870)', async () => {
+    vi.mocked(api.printSpoolLabels).mockResolvedValue(PDF_BLOB);
+    render(
+      <LabelTemplatePickerModal
+        isOpen={true}
+        onClose={vi.fn()}
+        availableSpools={SPOOLS}
+        initialSelectedIds={[1]}
+        spoolmanMode={false}
+      />,
+    );
+
+    fireEvent.click(screen.getByText(/black & white printer/i));
+    fireEvent.click(screen.getByText(/Box label \(40 × 30 mm\)/i));
+
+    await waitFor(() => {
+      expect(api.printSpoolLabels).toHaveBeenCalledWith({
+        spool_ids: [1],
+        template: 'box_40x30',
+        monochrome: true,
+        starting_position: 1,
+      });
+    });
+  });
+
+  it('sends the selected starting position for an Avery sheet', async () => {
+    vi.mocked(api.printSpoolLabels).mockResolvedValue(PDF_BLOB);
+    render(
+      <LabelTemplatePickerModal
+        isOpen={true}
+        onClose={vi.fn()}
+        availableSpools={SPOOLS}
+        initialSelectedIds={[1]}
+        spoolmanMode={false}
+      />,
+    );
+
+    fireEvent.change(screen.getByTestId('label-starting-position'), { target: { value: '8' } });
+    expect(screen.getByTestId('label-starting-position-status')).toHaveTextContent(/Positions 1 through 7/i);
+    fireEvent.click(screen.getByTestId('print-labels-avery_5160'));
+
+    await waitFor(() => {
+      expect(api.printSpoolLabels).toHaveBeenCalledWith({
+        spool_ids: [1],
+        template: 'avery_5160',
+        monochrome: false,
+        starting_position: 8,
+      });
+    });
+  });
+
+  it('renders a single skipped position without treating the value as a pluralization key', () => {
+    render(
+      <LabelTemplatePickerModal
+        isOpen={true}
+        onClose={vi.fn()}
+        availableSpools={SPOOLS}
+        initialSelectedIds={[1]}
+        spoolmanMode={false}
+      />,
+    );
+
+    fireEvent.change(screen.getByTestId('label-starting-position'), { target: { value: '2' } });
+    expect(screen.getByTestId('label-starting-position-status')).toHaveTextContent(
+      'Positions 1 through 1 will be left blank on the first sheet.',
+    );
+  });
+
+  it('explains each Avery template capacity when disabling it', () => {
+    render(
+      <LabelTemplatePickerModal
+        isOpen={true}
+        onClose={vi.fn()}
+        availableSpools={SPOOLS}
+        initialSelectedIds={[1]}
+        spoolmanMode={false}
+      />,
+    );
+
+    fireEvent.change(screen.getByTestId('label-starting-position'), { target: { value: '25' } });
+    const l7160Button = screen.getByTestId('print-labels-avery_l7160');
+    expect(l7160Button).toBeDisabled();
+    expect(within(l7160Button).getByText(/between 1 and 21/)).toBeInTheDocument();
+    expect(screen.getByTestId('print-labels-avery_5160')).toBeEnabled();
   });
 });

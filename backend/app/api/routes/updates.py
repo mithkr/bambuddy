@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import sys
+import time
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends
@@ -31,6 +32,61 @@ _update_status = {
     "error": None,
 }
 
+# GitHub rate-limit backoff (#1420): when api.github.com returns 403 with
+# X-RateLimit-Remaining=0, refuse to retry until X-RateLimit-Reset (epoch
+# seconds). Falls back to a 1-hour pause if the header is absent. Prevents
+# the update checker from hammering GitHub once the unauthenticated quota
+# (60 req/hr per source IP) is exhausted.
+_GITHUB_RATE_LIMIT_FALLBACK_SECONDS = 3600
+_github_rate_limit_until: float = 0.0
+
+
+def _seconds_until_github_unblocked() -> float:
+    """Return seconds remaining until GitHub backoff lifts, or 0 if unblocked."""
+    remaining = _github_rate_limit_until - time.time()
+    return remaining if remaining > 0 else 0.0
+
+
+def _record_github_rate_limit(response: httpx.Response) -> None:
+    """Set the backoff window from a GitHub 403 response's headers."""
+    global _github_rate_limit_until
+    reset_header = response.headers.get("X-RateLimit-Reset")
+    reset_at: float | None = None
+    if reset_header:
+        try:
+            reset_at = float(reset_header)
+        except ValueError:
+            reset_at = None
+    if reset_at is None:
+        reset_at = time.time() + _GITHUB_RATE_LIMIT_FALLBACK_SECONDS
+    # Floor at a 60s minimum: protects against clock skew between the container
+    # and GitHub (parsed reset epoch in the past would otherwise leave us with
+    # no real backoff and we'd hammer GitHub again immediately).
+    reset_at = max(reset_at, time.time() + 60)
+    # Only extend the window — never shorten it via an out-of-order response.
+    if reset_at > _github_rate_limit_until:
+        _github_rate_limit_until = reset_at
+    logger.warning(
+        "GitHub rate limit hit; suppressing update checks for %.0fs (reset header=%s)",
+        _seconds_until_github_unblocked(),
+        reset_header,
+    )
+
+
+def _is_github_rate_limit_response(response: httpx.Response) -> bool:
+    """Detect a rate-limit response from GitHub (403/429 with Remaining=0)."""
+    if response.status_code not in (403, 429):
+        return False
+    remaining = response.headers.get("X-RateLimit-Remaining")
+    if remaining == "0":
+        return True
+    # Some proxies strip the header; fall back to body inspection.
+    try:
+        body = response.text or ""
+    except Exception:
+        body = ""
+    return "rate limit" in body.lower() or "API rate limit exceeded" in body
+
 
 def _is_docker_environment() -> bool:
     """Detect if running inside a Docker container."""
@@ -54,6 +110,84 @@ def _is_docker_environment() -> bool:
     return False
 
 
+# Mount points the shipped compose file gives Bambuddy. Only these are
+# consulted when guessing the compose directory — an arbitrary bind mount
+# (a NAS share, an external library root) says nothing about where the
+# compose file lives.
+_COMPOSE_BIND_MOUNTPOINTS = ("/app/data", "/app/logs")
+
+# A named volume resolves to ``.../docker/volumes/<project>_bambuddy_data/_data``
+# in mountinfo. That names the compose *project* but reveals nothing about
+# the directory holding the compose file, so these entries are skipped.
+_DOCKER_NAMED_VOLUME_ROOT = re.compile(r"/docker/volumes/[^/]+/_data/?$")
+
+
+def _compose_dir_from_mountinfo() -> str | None:
+    """Guess the host directory holding the compose file, or None (#2664).
+
+    ``docker compose pull`` only works from the directory containing the
+    compose file, so the command the update box prints is unusable until the
+    user remembers where that is. Compose knows the answer — it stamps
+    ``com.docker.compose.project.working_dir`` onto every container it
+    creates — but reading your own labels requires the Docker socket, and
+    mounting that into Bambuddy would hand the container root-equivalent
+    access to the host in exchange for a convenience string. So we infer.
+
+    ``/proc/self/mountinfo`` exposes the *host* side of a bind mount in its
+    root field: a ``./data:/app/data`` line in the compose file surfaces as
+    ``/opt/bambuddy/data``, whose parent is the compose directory. The leaf
+    must match the mount point's own name before we take the parent —
+    ``/mnt/nas/prints:/app/data`` is a bind mount whose parent is emphatically
+    not a compose directory.
+
+    This is a guess and is treated as one — it only ever prefills the setting
+    the user can overwrite. The root field is relative to the *mounted device*
+    rather than to the host's ``/``, so a compose directory that sits under a
+    separate mount loses that mount's own prefix. Measured against real
+    containers: a compose file on the root filesystem (here a ZFS dataset
+    mounted at ``/``) came back exactly right, while one under ``/tmp`` — its
+    own tmpfs — inferred ``/claude-1001/...`` for ``/tmp/claude-1001/...``.
+    Nothing inside the container can tell the two apart, which is precisely
+    why the field is editable. The shipped compose file uses named volumes,
+    for which nothing is inferable at all.
+    """
+    try:
+        with open("/proc/self/mountinfo") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+
+    for line in lines:
+        parts = line.split()
+        # mountID parentID major:minor root mountPoint ...
+        if len(parts) < 5:
+            continue
+        root, mount_point = parts[3], parts[4]
+        if mount_point not in _COMPOSE_BIND_MOUNTPOINTS:
+            continue
+        if _DOCKER_NAMED_VOLUME_ROOT.search(root):
+            continue
+        parent, _, leaf = root.rstrip("/").rpartition("/")
+        if parent and leaf == mount_point.rsplit("/", 1)[-1]:
+            return parent
+    return None
+
+
+def _detect_compose_dir() -> str | None:
+    """Best-effort compose directory for the update instructions (#2664).
+
+    ``BAMBUDDY_COMPOSE_DIR`` wins when set — it is the only source that is
+    stated rather than inferred, and the shipped compose file carries a
+    commented ``${PWD}`` line for it.
+    """
+    env_dir = os.environ.get("BAMBUDDY_COMPOSE_DIR", "").strip()
+    if env_dir:
+        return env_dir
+    if not _is_docker_environment():
+        return None
+    return _compose_dir_from_mountinfo()
+
+
 def _is_ha_addon() -> bool:
     """Detect if running as a Home Assistant Supervisor addon.
 
@@ -62,6 +196,50 @@ def _is_ha_addon() -> bool:
     check is sufficient with no false-positive surface.
     """
     return bool(os.environ.get("SUPERVISOR_TOKEN"))
+
+
+def _is_windows_installer_install() -> bool:
+    """Detect a Windows install that came from the Inno Setup installer.
+
+    The installer stages backend source via ``shutil.copytree`` (no ``.git``
+    directory) and does not bundle ``git.exe`` — so the git-fetch-and-reset
+    update path used everywhere else is structurally inoperable here. We
+    surface this as a distinct ``update_method`` and direct the user at the
+    release asset instead.
+
+    A Windows developer running from a real ``git clone`` keeps the git
+    path (``.git`` present), so this only catches installer users.
+    """
+    if sys.platform != "win32":
+        return False
+    return not (settings.app_dir / ".git").exists()
+
+
+def _find_windows_installer_asset(release_data: dict) -> str | None:
+    """Pick the Windows installer .exe out of a GitHub release's assets list.
+
+    Both filenames the workflow uploads end in ``windows-x64-setup.exe``
+    (versioned ``bambuddy-<version>-windows-x64-setup.exe`` and the
+    unversioned alias ``bambuddy-windows-x64-setup.exe`` on non-daily tags
+    only). Either works as a download URL; we prefer the versioned form
+    because it's the one guaranteed to exist on every release including
+    dailies.
+    """
+    assets = release_data.get("assets") or []
+    versioned: str | None = None
+    unversioned: str | None = None
+    for asset in assets:
+        name = asset.get("name") or ""
+        url = asset.get("browser_download_url")
+        if not isinstance(name, str) or not isinstance(url, str):
+            continue
+        if not name.endswith("windows-x64-setup.exe"):
+            continue
+        if name == "bambuddy-windows-x64-setup.exe":
+            unversioned = url
+        else:
+            versioned = url
+    return versioned or unversioned
 
 
 def _find_executable(name: str) -> str | None:
@@ -125,12 +303,16 @@ def _parse_github_remote(url: str) -> tuple[str, str] | None:
     return (parts[0], parts[1])
 
 
-async def _origin_points_at_repo(git_path: str, git_config: list[str], base_dir, expected_repo: str) -> bool:
+async def _origin_points_at_repo(git_path: str, git_config: list[str], app_dir, expected_repo: str) -> bool:
     """Return True iff the working tree's `origin` already resolves to
     `<owner>/<repo>` matching `expected_repo` (e.g. "maziggy/bambuddy"),
     regardless of whether it's the SSH or HTTPS form. Used to skip the
     `git remote set-url origin https://...` rewrite when the developer's
-    SSH origin is already correct — see `_perform_update` for context."""
+    SSH origin is already correct — see `_perform_update` for context.
+
+    ``app_dir`` is the working tree (where ``.git`` lives), not the data
+    dir — see #1715 for the separate-mount layout that proved why this
+    must NOT be ``base_dir``."""
     try:
         process = await asyncio.create_subprocess_exec(
             git_path,
@@ -138,7 +320,7 @@ async def _origin_points_at_repo(git_path: str, git_config: list[str], base_dir,
             "remote",
             "get-url",
             "origin",
-            cwd=str(base_dir),
+            cwd=str(app_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -287,6 +469,23 @@ async def check_for_updates(
     beta_setting = result.scalar_one_or_none()
     include_beta = beta_setting and beta_setting.value.lower() == "true"
 
+    # Short-circuit if we're still inside a GitHub rate-limit backoff window (#1420).
+    backoff_remaining = _seconds_until_github_unblocked()
+    if backoff_remaining > 0:
+        _update_status = {
+            "status": "error",
+            "progress": 0,
+            "message": "GitHub rate limit reached",
+            "error": "GitHub rate limit reached; retry later",
+        }
+        return {
+            "update_available": False,
+            "current_version": APP_VERSION,
+            "latest_version": None,
+            "error": "GitHub rate limit reached; retry later",
+            "retry_after_seconds": int(backoff_remaining),
+        }
+
     _update_status = {
         "status": "checking",
         "progress": 0,
@@ -301,6 +500,22 @@ async def check_for_updates(
                 headers={"Accept": "application/vnd.github.v3+json"},
                 timeout=10.0,
             )
+
+            if _is_github_rate_limit_response(response):
+                _record_github_rate_limit(response)
+                _update_status = {
+                    "status": "error",
+                    "progress": 0,
+                    "message": "GitHub rate limit reached",
+                    "error": "GitHub rate limit reached; retry later",
+                }
+                return {
+                    "update_available": False,
+                    "current_version": APP_VERSION,
+                    "latest_version": None,
+                    "error": "GitHub rate limit reached; retry later",
+                    "retry_after_seconds": int(_seconds_until_github_unblocked()),
+                }
 
             if response.status_code == 404:
                 # No releases yet
@@ -366,10 +581,15 @@ async def check_for_updates(
 
             is_docker = _is_docker_environment()
             is_ha_addon = _is_ha_addon()
+            is_windows_installer = _is_windows_installer_install()
+            installer_download_url: str | None = None
             if is_ha_addon:
                 update_method = "ha_addon"
             elif is_docker:
                 update_method = "docker"
+            elif is_windows_installer:
+                update_method = "windows_installer"
+                installer_download_url = _find_windows_installer_asset(release_data)
             else:
                 update_method = "git"
             return {
@@ -382,7 +602,14 @@ async def check_for_updates(
                 "published_at": published_at,
                 "is_docker": is_docker,
                 "is_ha_addon": is_ha_addon,
+                "is_windows_installer": is_windows_installer,
                 "update_method": update_method,
+                "installer_download_url": installer_download_url,
+                # Prefill only — never the value the user saved. The settings
+                # response owns ``docker_compose_dir``; keeping the two apart
+                # means clearing the field falls back to the guess instead of
+                # resurrecting the cleared value from a stale update check.
+                "compose_dir_detected": _detect_compose_dir() if update_method == "docker" else None,
             }
 
     except httpx.HTTPError as e:
@@ -419,6 +646,10 @@ async def _discover_target_release(db: AsyncSession) -> str | None:
     beta_setting = result.scalar_one_or_none()
     include_beta = beta_setting and beta_setting.value.lower() == "true"
 
+    if _seconds_until_github_unblocked() > 0:
+        logger.warning("Skipping update target discovery: GitHub rate-limit backoff still active")
+        return None
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -426,6 +657,9 @@ async def _discover_target_release(db: AsyncSession) -> str | None:
                 headers={"Accept": "application/vnd.github.v3+json"},
                 timeout=10.0,
             )
+            if _is_github_rate_limit_response(response):
+                _record_github_rate_limit(response)
+                return None
             response.raise_for_status()
             releases = response.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -459,7 +693,16 @@ async def _perform_update(target_ref: str):
     global _update_status
 
     try:
-        base_dir = settings.base_dir
+        # Every git step runs against the working tree (app_dir), NOT base_dir.
+        # On a standard install with DATA_DIR=INSTALL_PATH/data, git happens
+        # to walk up from a subdirectory of the repo to find .git so cwd=base_dir
+        # used to silently work — but only by accident. On a native install with
+        # DATA_DIR mounted at an unrelated path (e.g. /srv/bambuddy/data while
+        # the install is /opt/bambuddy — see #1715), git can't walk up and every
+        # operation fails with "not a git repository". safe.directory has the
+        # same requirement: it must equal the repo root git discovers, not the
+        # data dir, or every call returns "fatal: detected dubious ownership."
+        app_dir = settings.app_dir
 
         # Find git executable (may not be in PATH when running as systemd service)
         git_path = _find_executable("git")
@@ -474,8 +717,9 @@ async def _perform_update(target_ref: str):
 
         logger.info("Using git at: %s", git_path)
 
-        # Git config to avoid safe.directory issues
-        git_config = ["-c", f"safe.directory={base_dir}"]
+        # Git config to avoid safe.directory issues — must point at the working
+        # tree (where .git lives), see app_dir comment above.
+        git_config = ["-c", f"safe.directory={app_dir}"]
 
         _update_status = {
             "status": "downloading",
@@ -497,7 +741,7 @@ async def _perform_update(target_ref: str):
         # correct repo are preserved; only missing / wrong / corrupted
         # origins get reset to HTTPS.
         https_url = f"https://github.com/{GITHUB_REPO}.git"
-        if not await _origin_points_at_repo(git_path, git_config, base_dir, GITHUB_REPO):
+        if not await _origin_points_at_repo(git_path, git_config, app_dir, GITHUB_REPO):
             process = await asyncio.create_subprocess_exec(
                 git_path,
                 *git_config,
@@ -505,7 +749,7 @@ async def _perform_update(target_ref: str):
                 "set-url",
                 "origin",
                 https_url,
-                cwd=str(base_dir),
+                cwd=str(app_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -523,14 +767,23 @@ async def _perform_update(target_ref: str):
         # locally resolvable for the reset below. `--tags` is required —
         # plain `git fetch origin` doesn't bring tags by default, so a
         # release tag would not be resolvable.
+        #
+        # `--force` lets a moved tag on the remote overwrite the local copy.
+        # Without it, any tag that was re-tagged upstream (e.g. v0.2.1 being
+        # re-pointed after a hotfix re-tag) makes `git fetch --tags` return
+        # a non-zero exit even though every other ref fetched cleanly —
+        # which we'd then surface as "Failed to fetch updates" to the user.
+        # The in-app updater's contract is "sync me to the remote"; force-
+        # overwriting a stale local tag matches that intent.
         process = await asyncio.create_subprocess_exec(
             git_path,
             *git_config,
             "fetch",
             "--prune",
             "--tags",
+            "--force",
             "origin",
-            cwd=str(base_dir),
+            cwd=str(app_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -566,7 +819,7 @@ async def _perform_update(target_ref: str):
             "reset",
             "--hard",
             target_ref,
-            cwd=str(base_dir),
+            cwd=str(app_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -591,12 +844,9 @@ async def _perform_update(target_ref: str):
         }
 
         # Install Python dependencies — must run from the source-code directory
-        # (where requirements.txt lives), not the data dir. On native installs
-        # systemd sets DATA_DIR=INSTALL_PATH/data, so `base_dir` is the data dir,
-        # not the working tree. `git reset` above worked from base_dir because
-        # git walks up looking for .git, but `pip install -r requirements.txt`
-        # needs the file in cwd literally.
-        app_dir = settings.app_dir
+        # (where requirements.txt lives). app_dir is already resolved at the top
+        # of this function; see the comment there for why every step uses it
+        # instead of base_dir.
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -709,6 +959,19 @@ async def apply_update(
                 "Docker installations cannot be updated in-app. "
                 "Please update via Docker Compose: "
                 "git pull && docker compose build --pull && docker compose up -d"
+            ),
+        }
+    if _is_windows_installer_install():
+        # The installer layout has no ``.git`` and no bundled ``git.exe`` —
+        # the git-fetch path would fail. Frontend swaps the "Update now"
+        # button for a Download Installer link via update_method, so this
+        # branch is only reached if /apply is hit directly.
+        return {
+            "success": False,
+            "is_windows_installer": True,
+            "message": (
+                "Windows installations are updated by re-running the installer. "
+                "Download the latest installer from the Bambuddy releases page."
             ),
         }
 

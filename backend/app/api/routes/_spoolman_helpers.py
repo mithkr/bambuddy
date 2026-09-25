@@ -5,15 +5,15 @@ No heavy dependencies — importable in unit tests without the full backend stac
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
 import math
 import re
 from typing import Any
-from urllib.parse import urlparse
 
 from typing_extensions import TypedDict
+
+from backend.app.api.routes._url_safety import assert_safe_lan_service_url
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +26,15 @@ class MappedSpoolFields(TypedDict):
     subtype: str | None
     brand: str | None
     color_name: str | None
+    color_name_is_synthesized: bool
     rgba: str | None
+    extra_colors: str | None
+    effect_type: None
     label_weight: int | None
     core_weight: int | None
     core_weight_catalog_id: None
     weight_used: float | None
+    weight_used_baseline: float | None
     weight_locked: bool
     last_scale_weight: None
     last_weighed_at: None
@@ -51,6 +55,7 @@ class MappedSpoolFields(TypedDict):
     updated_at: str | None
     cost_per_kg: float | None
     storage_location: str | None
+    location_id: int | None
     k_profiles: list[Any]
 
 
@@ -74,79 +79,24 @@ class NormalizedFilament(TypedDict):
     vendor: NormalizedVendorRef | None
 
 
-_CLOUD_METADATA_IPS = frozenset(
-    {
-        # AWS / GCP / Azure / Oracle / DigitalOcean IMDS
-        ipaddress.ip_address("169.254.169.254"),
-        # Alibaba Cloud metadata
-        ipaddress.ip_address("100.100.100.200"),
-        # AWS IMDS IPv6
-        ipaddress.ip_address("fd00:ec2::254"),
-    }
-)
-
-
 def assert_safe_spoolman_url(url: str) -> None:
-    """Raise ValueError if *url* should be blocked as an SSRF risk.
+    """Raise ValueError if the Spoolman *url* should be blocked as an SSRF risk.
 
-    Bambuddy is typically deployed on a home LAN alongside Spoolman, so
-    loopback (127.0.0.1) and RFC-1918 private ranges (192.168.x.x, 10.x.x.x,
-    172.16-31.x) must be permitted — they are THE normal Spoolman topology.
-    This guard therefore targets the genuinely dangerous cases only.
+    Thin wrapper over the shared LAN-service policy — see
+    ``_url_safety.assert_safe_lan_service_url`` for what is and isn't
+    rejected, and why loopback/RFC-1918 are deliberately permitted (running
+    Spoolman on the same host or home LAN is THE normal topology).
 
-    Checks performed:
-    - Scheme must be http or https (no file://, gopher://, dict://, etc.).
-    - Numeric-encoded IP addresses in decimal (e.g. ``2130706433``) or hex
-      (e.g. ``0x7f000001``) are rejected. Python's ``ipaddress`` module raises
-      ``ValueError`` for these forms so they would otherwise bypass the
-      explicit-IP block below, but libc (and browsers) resolve them as valid
-      IPv4 addresses.
-    - Cloud provider metadata endpoints (169.254.169.254, 100.100.100.200,
-      fd00:ec2::254) are blocked — the classic SSRF credential-exfil target.
-    - Multicast (224.0.0.0/4, ff00::/8) and unspecified (0.0.0.0, ::) addresses
-      are blocked — pointless as a destination and suggests misuse.
-    - IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) are unwrapped so they cannot
-      bypass the checks above.
-
-    Hostname-based addresses ("localhost", "spoolman.lan", "internal.corp")
-    are out of scope — DNS resolution is deliberately not performed here.
+    Kept as a named function because the "Spoolman URL …" wording in its
+    errors is user-facing and asserted by existing tests.
     """
-    parsed = urlparse(url)
-    if parsed.scheme.lower() not in ("http", "https"):
-        raise ValueError("Spoolman URL must use http or https")
-
-    hostname = (parsed.hostname or "").lower()
-
-    # Reject decimal- and hex-encoded IPs (e.g. http://2130706433/ or
-    # http://0x7f000001/). These slip past ipaddress.ip_address() but libc
-    # (and browsers) parse them as IPv4 — an obvious bypass if not caught.
-    if re.match(r"^(0x[0-9a-f]+|[0-9]+)$", hostname, re.I):
-        raise ValueError("Spoolman URL must not use numeric-encoded IP addresses; use standard dotted-decimal notation")
-
-    try:
-        addr = ipaddress.ip_address(hostname)
-    except ValueError:
-        # Not a bare IP address — includes intentional cases such as "localhost" and
-        # RFC-1918 hostnames ("spoolman.lan", "192.168.1.10" would be caught above as
-        # a dotted-decimal IP; symbolic names resolve via DNS which is out of scope).
-        # Running Spoolman on the same host or home LAN is the standard Bambuddy
-        # topology, so loopback and private ranges are deliberately NOT blocked here.
-        return
-
-    # Unwrap IPv4-mapped IPv6 (::ffff:169.254.169.254 etc.) so attackers can't
-    # encode a blocked IPv4 into an IPv6 literal to bypass the check.
-    effective: ipaddress.IPv4Address | ipaddress.IPv6Address = addr
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        effective = addr.ipv4_mapped
-
-    if effective in _CLOUD_METADATA_IPS:
-        raise ValueError("Spoolman URL must not point to a cloud metadata endpoint")
-
-    if effective.is_multicast or effective.is_unspecified:
-        raise ValueError("Spoolman URL must not point to a multicast or unspecified address")
+    assert_safe_lan_service_url(url, label="Spoolman URL")
 
 
-_COLOR_HEX_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+# Six characters, or eight when the filament carries an alpha byte. The write
+# side stores eight only for genuinely translucent spools (#2912); rejecting
+# them here turned every clear spool into neutral grey on read.
+_COLOR_HEX_RE = re.compile(r"^[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?$")
 _TAG_HEX_RE = re.compile(r"^[0-9A-F]+$")
 
 
@@ -208,6 +158,30 @@ def _extract_extra_str(extra: dict, key: str) -> str:
     return decoded if isinstance(decoded, str) else ""
 
 
+def parse_spoolman_multi_colors(filament: dict) -> list[str]:
+    """Spoolman's ``multi_color_hexes`` as a list of bare 6/8-char hex tokens.
+
+    Spoolman stores the extra stops of a gradient / dual / multi-colour
+    filament here, and writes the field as a comma-separated string in some
+    releases and a list in others -- both shapes are accepted. Tokens keep the
+    case they arrived in and lose any leading ``#``, which is the form
+    ``Spool.extra_colors`` stores and ``parseStops`` on the client expects.
+
+    Shared with the label renderer rather than parsed twice: the two read the
+    same field for the same purpose, and a swatch on a printer card that
+    disagreed with the swatch on the printed label would be worse than either
+    being wrong on its own.
+    """
+    raw = filament.get("multi_color_hexes")
+    if isinstance(raw, str):
+        tokens = raw.split(",")
+    elif isinstance(raw, list):
+        tokens = [str(token) for token in raw]
+    else:
+        return []
+    return [cleaned for token in tokens if (cleaned := token.strip().lstrip("#"))]
+
+
 def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
     """Convert a raw Spoolman spool dict to the InventorySpool-compatible format.
 
@@ -252,13 +226,39 @@ def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
     else:
         subtype = filament_name or None
 
-    # Colour: validate as 6-char hex; fall back to neutral grey for invalid values
+    # Colour: validate as 6- or 8-char hex; fall back to neutral grey for invalid
+    # values. An 8-char value already carries its alpha, so appending the opaque
+    # byte would push it to ten and lose the translucency it was stored to keep.
     raw_color = (filament.get("color_hex") or "").upper().removeprefix("#")
     color_hex: str = raw_color if _COLOR_HEX_RE.match(raw_color) else "808080"
-    rgba: str = color_hex + "FF"
+    rgba: str = color_hex if len(color_hex) == 8 else color_hex + "FF"
+    # Spoolman carries the extra stops but has no concept of a surface effect
+    # -- its only neighbouring field is `multi_color_direction`, which says how
+    # the stops are laid out, not that the filament is silk or glitter. So a
+    # Spoolman spool can render its gradient and never an effect overlay, and
+    # `effect_type` is pinned to None rather than guessed at.
+    extra_stops = parse_spoolman_multi_colors(filament)
+    extra_colors: str | None = ",".join(extra_stops) if extra_stops else None
 
     label_weight: int = _safe_int(filament.get("weight"), 1000)
-    used_weight: float = _safe_float(spool.get("used_weight"), 0.0)
+    real_used_weight: float = _safe_float(spool.get("used_weight"), 0.0)
+    # Parity with internal mode (#1390): the InventorySpool shape lets the
+    # frontend compute `remaining = label_weight - weight_used` and
+    # `consumed = weight_used - weight_used_baseline`. Map Spoolman's two
+    # independent fields (used_weight, remaining_weight) onto that shape:
+    #   weight_used = label_weight - remaining_weight  (so remaining matches)
+    #   baseline    = weight_used - used_weight        (so consumed matches)
+    # When remaining_weight is unset (legacy spools, or filament linked but
+    # never primed), fall back to the old behaviour: weight_used =
+    # used_weight, baseline = 0.
+    remaining_raw = spool.get("remaining_weight")
+    if remaining_raw is not None:
+        remaining_weight: float = _safe_float(remaining_raw, 0.0)
+        used_weight: float = max(0.0, float(label_weight) - remaining_weight)
+        weight_used_baseline: float = max(0.0, used_weight - real_used_weight)
+    else:
+        used_weight = real_used_weight
+        weight_used_baseline = 0.0
 
     # Archived state – Spoolman uses a boolean ``archived`` field
     archived: bool = spool.get("archived", False)
@@ -268,15 +268,30 @@ def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
 
     created_at: str | None = spool.get("registered") or None
 
-    # Spoolman doesn't standardise a `color_name` field — most installs only
-    # populate `color_hex` (the swatch) and the filament's `name` (which often
-    # carries the colour, e.g. "PLA Basic Red"). Without a fallback the
-    # frontend lists a sea of "Unknown color" entries that all look identical
-    # except for the swatch. Fall back to the filament name minus material
-    # prefix (the same string the `subtype` field already carries — typically
-    # "Basic Red" / "PLA+ Black" / etc.) so the user can tell spools apart at
-    # a glance even on Spoolman installs that don't fill color_name.
-    color_name: str | None = filament.get("color_name") or subtype or None
+    # Spoolman has no `color_name` field on Filament — confirmed against the
+    # FilamentUpdateParameters schema in 0.23.1: name/vendor_id/material/price/
+    # density/diameter/weight/spool_weight/article_number/comment/extruder_temp/
+    # bed_temp/color_hex/multi_color_hexes/multi_color_direction/external_id/
+    # extra, no color_name (#1357). The previous attempt (b8e350c3) was
+    # PATCHing a key Spoolman silently discards, which is why color_name
+    # never actually persisted from the user's edits.
+    #
+    # We persist it ourselves under spool.extra.bambu_color_name (JSON-encoded
+    # string, same pattern as bambu_slicer_filament). Read order:
+    #   1. spool.extra.bambu_color_name (the canonical store)
+    #   2. filament.color_name (forward-compat — picks up the value if a
+    #      future Spoolman release adds the field, or if an admin populated
+    #      it via a custom extra-field they registered themselves)
+    #   3. subtype (synth fallback so the inventory list isn't a sea of
+    #      "Unknown color" entries on installs with neither field set)
+    #
+    # color_name_is_synthesized = True only when we fell back to subtype.
+    # The edit form uses it to leave the input blank, so the user doesn't
+    # round-trip the synth value back as if they had set it.
+    extra_color_name = _extract_extra_str(extra, "bambu_color_name") or None
+    stored_color_name = extra_color_name or (filament.get("color_name") or None)
+    color_name: str | None = stored_color_name or subtype or None
+    color_name_is_synthesized: bool = stored_color_name is None and color_name is not None
 
     nozzle_temp_raw = filament.get("settings_extruder_temp")
     nozzle_temp_min: int | None = _safe_int(nozzle_temp_raw, 0) or None
@@ -286,7 +301,10 @@ def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
         "material": material,
         "subtype": subtype,
         "color_name": color_name,
+        "color_name_is_synthesized": color_name_is_synthesized,
         "rgba": rgba,
+        "extra_colors": extra_colors,
+        "effect_type": None,
         "brand": vendor.get("name") or None,
         "label_weight": label_weight,
         "core_weight": _safe_int(
@@ -294,6 +312,7 @@ def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
         ),
         "core_weight_catalog_id": None,
         "weight_used": used_weight,
+        "weight_used_baseline": weight_used_baseline,
         "weight_locked": False,
         "last_scale_weight": None,
         "last_weighed_at": None,
@@ -322,5 +341,6 @@ def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
         "updated_at": created_at,
         "cost_per_kg": _safe_optional_float(spool.get("price")),
         "storage_location": spool.get("location") or None,
+        "location_id": None,
         "k_profiles": [],
     }

@@ -34,15 +34,25 @@ from backend.app.api.routes._spoolman_helpers import (
 from backend.app.core.auth import RequirePermissionIfAuthEnabled
 from backend.app.core.database import get_db
 from backend.app.core.permissions import Permission
+from backend.app.core.websocket import ws_manager
 from backend.app.models.ams_label import AmsLabel
 from backend.app.models.printer import Printer
 from backend.app.models.settings import Settings
+from backend.app.models.spool_filament_preset import SpoolmanFilamentPreset
 from backend.app.models.spoolman_k_profile import SpoolmanKProfile
 from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 from backend.app.models.user import User
-from backend.app.schemas.spool import SpoolKProfileBase
+from backend.app.schemas.spool import SpoolFilamentPresetBase, SpoolKProfileBase
 from backend.app.schemas.spoolman import SpoolmanFilamentPatch, SpoolmanSlotAssignmentEnriched
+from backend.app.services.location_service import (
+    enrich_spool_dicts_with_location_id,
+    maybe_sync_spoolman_locations,
+    resolve_spoolman_location_string,
+)
 from backend.app.services.printer_manager import printer_manager
+from backend.app.services.slicer_filament_resolver import resolve_slicer_filament
+from backend.app.services.slot_nozzle import resolve_slot_nozzle
+from backend.app.services.spool_filament_preset import resolve_spoolman_preset
 from backend.app.services.spoolman import (
     SpoolmanClient,
     SpoolmanClientError,
@@ -51,11 +61,15 @@ from backend.app.services.spoolman import (
     get_spoolman_client,
     init_spoolman_client,
 )
+from backend.app.services.spoolman_tracking import get_fallback_spool_tag_for_slot
+from backend.app.services.tag_conflict import tag_already_linked
+from backend.app.utils.color_utils import spoolman_color_hex
 from backend.app.utils.filament_ids import (
     GENERIC_FILAMENT_IDS,
-    MATERIAL_TEMPS,
+    filament_id_to_setting_id,
     normalize_slicer_filament,
 )
+from backend.app.utils.filament_types import nozzle_temp_range, printer_filament_type
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +85,89 @@ _HEALTH_CHECK_TTL = 30.0  # seconds
 def _tag_cleared(val: str | None) -> bool:
     """Return True when a PATCH field explicitly removes a tag (null)."""
     return val is None
+
+
+async def _clear_stale_tag_links(
+    client: SpoolmanClient,
+    *,
+    tag: str,
+    keep_spool_id: int,
+    log_context: str,
+) -> int:
+    """Clear extra.tag on OTHER spools still claiming the given tag (#1457).
+
+    A given AMS slot tag — whether a real RFID (tray_uuid/tag_uid) or the
+    deterministic fallback derived from (printer_serial, ams_id, tray_id) for
+    non-RFID slots — uniquely identifies one physical slot. When a spool is
+    (re)bound to that slot via Assign or Link, any other Spoolman spool whose
+    extra.tag still holds the same value is stale and would resurface in the
+    hover card / fill-level lookup.
+
+    Best-effort: per-spool patch failures are logged and skipped, never raised.
+    Returns the number of spools cleared.
+    """
+    if not tag:
+        return 0
+    tag_upper = tag.upper()
+
+    try:
+        spools = await client.get_spools()
+    except (SpoolmanClientError, SpoolmanUnavailableError) as exc:
+        logger.warning("Could not enumerate spools for stale-tag cleanup: %s", exc)
+        return 0
+
+    cleared = 0
+    for spool in spools:
+        spool_id = spool.get("id")
+        if not spool_id or spool_id == keep_spool_id:
+            continue
+        extra = spool.get("extra") or {}
+        raw_tag = extra.get("tag", "")
+        if not raw_tag:
+            continue
+        clean_tag = raw_tag.strip('"').upper()
+        if clean_tag != tag_upper:
+            continue
+        try:
+            await client.merge_spool_extra(spool_id, {"tag": json.dumps("")})
+            cleared += 1
+            logger.info(
+                "Cleared stale tag '%s' from Spoolman spool %s (%s; reassigned to spool %s)",
+                tag_upper[:16],
+                spool_id,
+                log_context,
+                keep_spool_id,
+            )
+        except (SpoolmanClientError, SpoolmanUnavailableError, SpoolmanNotFoundError) as exc:
+            logger.warning(
+                "Failed to clear stale tag on Spoolman spool %s: %s",
+                spool_id,
+                exc,
+            )
+    return cleared
+
+
+async def _clear_stale_slot_fallback_tag_links(
+    client: SpoolmanClient,
+    *,
+    printer_serial: str,
+    ams_id: int,
+    tray_id: int,
+    keep_spool_id: int,
+) -> int:
+    """Convenience wrapper: compute the slot's fallback tag and clear it from
+    other spools. Used by the assign route, which identifies the slot by
+    (printer, ams, tray) rather than by an explicit tag value.
+    """
+    fallback_tag = get_fallback_spool_tag_for_slot(printer_serial, ams_id, tray_id)
+    if not fallback_tag:
+        return 0
+    return await _clear_stale_tag_links(
+        client,
+        tag=fallback_tag,
+        keep_spool_id=keep_spool_id,
+        log_context=f"printer={printer_serial} ams={ams_id} tray={tray_id}",
+    )
 
 
 async def _get_client(db: AsyncSession) -> SpoolmanClient:
@@ -221,6 +318,7 @@ class SpoolmanInventoryCreate(BaseModel):
     note: str | None = Field(None, max_length=1000)
     cost_per_kg: float | None = Field(None, ge=0.0, le=1_000_000.0)
     storage_location: str | None = Field(None, max_length=255)
+    location_id: int | None = Field(None, gt=0)
     # BambuStudio slicer preset for this spool. Spoolman has no native field
     # for this, so we persist it under the bambu_slicer_filament[_name] keys
     # in the spool's extra dict and read it back in _map_spoolman_spool.
@@ -263,6 +361,7 @@ class SpoolmanInventoryUpdate(BaseModel):
     tag_uid: str | None = Field(None, min_length=8, max_length=30, pattern=r"^[0-9A-Fa-f]+$")
     tray_uuid: str | None = Field(None, min_length=32, max_length=32, pattern=r"^[0-9A-Fa-f]+$")
     storage_location: str | None = Field(None, max_length=255)
+    location_id: int | None = Field(None, gt=0)
     # BambuStudio slicer preset — persisted to Spoolman extra dict (see Create
     # schema). Pass an empty string to clear; null/omitted leaves unchanged.
     slicer_filament: str | None = Field(None, max_length=128)
@@ -344,6 +443,13 @@ async def list_spools(
 ) -> list[dict]:
     """Return all Spoolman spools in the InventorySpool format."""
     client = await _get_client(db)
+    # Sync after we have the route-resolved client so tests that patch the
+    # route module's get_spoolman_client/init_spoolman_client also catch the
+    # sync's client lookup — otherwise the location_service path imports from
+    # backend.app.services.spoolman directly and bypasses the patch.
+    if await maybe_sync_spoolman_locations(db, client=client):
+        await db.commit()
+
     async with _translate_spoolman_errors():
         spools = await client.get_all_spools(allow_archived=include_archived)
 
@@ -365,6 +471,7 @@ async def list_spools(
         for m in mapped:
             m["k_profiles"] = kp_by_spool.get(m["id"], [])
 
+    await enrich_spool_dicts_with_location_id(db, mapped)
     return mapped
 
 
@@ -386,6 +493,7 @@ async def get_spool(
 
     kp_result = await db.execute(select(SpoolmanKProfile).where(SpoolmanKProfile.spoolman_spool_id == spool_id))
     mapped["k_profiles"] = [_k_profile_to_dict(kp) for kp in kp_result.scalars().all()]
+    await enrich_spool_dicts_with_location_id(db, [mapped])
     return mapped
 
 
@@ -399,7 +507,10 @@ async def _resolve_filament_id(data: SpoolmanInventoryCreate, client: SpoolmanCl
         return data.spoolman_filament_id
     # Validator guarantees material is non-None when spoolman_filament_id is None
     assert data.material is not None  # noqa: S101
-    color_hex = (data.rgba or "808080FF")[:6]
+    # `or "808080"` on the result rather than on the input: spoolman_color_hex
+    # returns None only for a missing value, so this is the same neutral grey the
+    # old inline default produced, without handing an Optional to a str parameter.
+    color_hex = spoolman_color_hex(data.rgba) or "808080"
     async with _translate_spoolman_errors():
         return await client.find_or_create_filament(
             material=data.material,
@@ -421,6 +532,18 @@ async def create_spool(
     client = await _get_client(db)
     filament_id = await _resolve_filament_id(data, client)
 
+    storage_location = data.storage_location
+    if "location_id" in data.model_fields_set or "storage_location" in data.model_fields_set:
+        try:
+            storage_location, _ = await resolve_spoolman_location_string(
+                db,
+                location_id=data.location_id,
+                storage_location=data.storage_location,
+                fields_set=set(data.model_fields_set),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     remaining = max(0.0, data.label_weight - data.weight_used)
     try:
         async with _translate_spoolman_errors():
@@ -428,7 +551,7 @@ async def create_spool(
                 filament_id=filament_id,
                 remaining_weight=remaining,
                 comment=data.note or None,
-                location=data.storage_location or None,
+                location=storage_location or None,
             )
     except HTTPException as exc:
         if exc.status_code == 404 and data.spoolman_filament_id is not None:
@@ -440,18 +563,24 @@ async def create_spool(
 
     spool, price_warnings = await _apply_price_if_set(client, spool, data.cost_per_kg)
 
-    # Persist slicer_filament under the spool's extra dict (mirror update_spool).
-    if data.slicer_filament is not None or data.slicer_filament_name is not None:
+    # Persist slicer_filament AND color_name under the spool's extra dict
+    # (mirror update_spool). Spoolman has no `color_name` field on filament
+    # (#1357) so we own the round-trip ourselves.
+    if data.slicer_filament is not None or data.slicer_filament_name is not None or data.color_name is not None:
         # Ensure extra fields are registered before write.
         if data.slicer_filament is not None:
             await client.ensure_extra_field("bambu_slicer_filament")
         if data.slicer_filament_name is not None:
             await client.ensure_extra_field("bambu_slicer_filament_name")
+        if data.color_name is not None:
+            await client.ensure_extra_field("bambu_color_name")
         new_extra: dict = {}
         if data.slicer_filament is not None:
             new_extra["bambu_slicer_filament"] = json.dumps(data.slicer_filament)
         if data.slicer_filament_name is not None:
             new_extra["bambu_slicer_filament_name"] = json.dumps(data.slicer_filament_name)
+        if data.color_name is not None:
+            new_extra["bambu_color_name"] = json.dumps(data.color_name)
         if new_extra:
             try:
                 async with _translate_spoolman_errors():
@@ -459,11 +588,12 @@ async def create_spool(
             except HTTPException:
                 # Best-effort — the spool already exists, log and continue.
                 logger.warning(
-                    "Failed to persist slicer_filament for spool %s",
+                    "Failed to persist slicer_filament/color_name for spool %s",
                     spool.get("id"),
                 )
 
     result = _map_spoolman_spool(spool)
+    await ws_manager.broadcast({"type": "inventory_changed"})
     if price_warnings:
         return JSONResponse(status_code=207, content={**result, "warnings": price_warnings})
     return result
@@ -489,6 +619,18 @@ async def bulk_create_spools(
             ) from exc
         raise
 
+    storage_location = data.storage_location
+    if "location_id" in data.model_fields_set or "storage_location" in data.model_fields_set:
+        try:
+            storage_location, _ = await resolve_spoolman_location_string(
+                db,
+                location_id=data.location_id,
+                storage_location=data.storage_location,
+                fields_set=set(data.model_fields_set),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     remaining = max(0.0, data.label_weight - data.weight_used)
     created: list[dict] = []
     failures: list[str] = []
@@ -498,7 +640,7 @@ async def bulk_create_spools(
                 filament_id=filament_id,
                 remaining_weight=remaining,
                 comment=data.note or None,
-                location=data.storage_location or None,
+                location=storage_location or None,
             )
         except (SpoolmanUnavailableError, SpoolmanClientError, SpoolmanNotFoundError) as exc:
             logger.warning("Bulk spool creation: one spool failed: %s", exc)
@@ -520,6 +662,8 @@ async def bulk_create_spools(
 
     if not created:
         raise HTTPException(status_code=500, detail="Failed to create any spools in Spoolman")
+
+    await ws_manager.broadcast({"type": "inventory_changed"})
 
     if len(created) < payload.quantity:
         # Some spool creations failed — return 207 Multi-Status so the caller
@@ -564,25 +708,110 @@ async def update_spool(
     material = data.material if data.material is not None else cur_mat
     subtype = data.subtype if data.subtype is not None else cur_subtype
     brand = data.brand if data.brand is not None else (cur_vendor.get("name") or None)
-    color_name = data.color_name if data.color_name is not None else (cur_filament.get("color_name") or None)
+    # color_name uses model_fields_set so explicit null (clear) is distinguishable
+    # from "field omitted" (don't touch). find_or_create_filament's convention:
+    # None = don't touch, "" = explicit clear, "value" = set.
+    if "color_name" in data.model_fields_set:
+        color_name = data.color_name if data.color_name is not None else ""
+    else:
+        color_name = cur_filament.get("color_name") or None
     cur_color = (cur_filament.get("color_hex") or "808080").upper().removeprefix("#")
-    rgba = data.rgba if data.rgba is not None else (cur_color + "FF")
+    # Handed over as stored. The opaque alpha this used to append was folded
+    # straight back off by `spoolman_color_hex` below, so the two paths landed on
+    # the same string and the append only obscured which shape was in hand (#2912).
+    rgba = data.rgba if data.rgba is not None else cur_color
     label_weight = data.label_weight if data.label_weight is not None else int(cur_filament.get("weight") or 1000)
-    weight_used = data.weight_used if data.weight_used is not None else float(current.get("used_weight") or 0)
+    # Default weight_used from the synthetic mapping (label - remaining) so an
+    # edit that doesn't touch the weight field preserves Spoolman's real
+    # remaining_weight after a "Reset usage to 0" — the previous code read
+    # Spoolman's used_weight directly, which is 0 post-reset, so
+    # `remaining = label - 0 = 1000` would overwrite the real remaining
+    # the next time the user edited any other field (#1390).
+    cur_remaining_raw = current.get("remaining_weight")
+    if cur_remaining_raw is not None:
+        synthetic_used = max(0.0, float(label_weight) - float(cur_remaining_raw))
+    else:
+        synthetic_used = float(current.get("used_weight") or 0)
+    weight_used = data.weight_used if data.weight_used is not None else synthetic_used
     note = data.note if data.note is not None else current.get("comment")
-    storage_location_changed = "storage_location" in data.model_fields_set
-    storage_location = data.storage_location if storage_location_changed else None
+    storage_location_changed = "storage_location" in data.model_fields_set or "location_id" in data.model_fields_set
+    storage_location = data.storage_location if "storage_location" in data.model_fields_set else None
+    if storage_location_changed:
+        try:
+            storage_location, _ = await resolve_spoolman_location_string(
+                db,
+                location_id=data.location_id,
+                storage_location=storage_location,
+                fields_set=set(data.model_fields_set),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    color_hex = rgba[:6]
-    async with _translate_spoolman_errors():
-        filament_id = await client.find_or_create_filament(
-            material=material,
-            subtype=subtype or "",
-            brand=brand,
-            color_hex=color_hex,
-            label_weight=label_weight,
-            color_name=color_name,
-        )
+    color_hex = spoolman_color_hex(rgba) or rgba
+
+    # Resolve which filament this spool should be linked to AFTER the edit.
+    #
+    # The old behaviour was always `find_or_create_filament`, which proliferated
+    # duplicate Spoolman filaments whenever the user changed any field that
+    # made up the match key (material/subtype/brand/color) — every edit minted
+    # a fresh row and orphaned the previous one (#1357 follow-up). To match
+    # internal-mode behaviour ([[feedback_inventory_modes_parity]]: editing a
+    # spool does not proliferate new entities), prefer PATCHing the current
+    # filament in place when it's a singleton.
+    cur_filament_id = cur_filament.get("id")
+    desired_name = f"{material} {subtype}".strip() if subtype else material
+    # Compare the stored shapes, not raw strings and not bare RGB prefixes. Raw
+    # strings make an opaque spool's six characters differ from an incoming eight
+    # and PATCH the filament on every no-op edit; bare prefixes make an
+    # alpha-only edit invisible so the change never lands (#2912).
+    cur_color_norm = spoolman_color_hex(cur_filament.get("color_hex")) or ""
+    cur_vendor_name = (cur_vendor.get("name") or "").strip()
+    cur_weight_int = int(cur_filament.get("weight") or 0)
+    metadata_unchanged = (
+        cur_filament_id
+        and (cur_filament.get("name") or "").strip() == desired_name
+        and (cur_filament.get("material") or "").upper() == material.upper()
+        and cur_color_norm == (color_hex or "").upper()
+        and cur_vendor_name.lower() == ((brand or "").strip().lower())
+        and cur_weight_int == int(label_weight)
+    )
+
+    if metadata_unchanged:
+        # No filament-side change at all — re-use the existing link, skip
+        # find_or_create entirely so a no-op edit (e.g. just changing
+        # weight_used or note) never even touches the filament catalogue.
+        filament_id = cur_filament_id
+    else:
+        async with _translate_spoolman_errors():
+            shared = await client.is_filament_shared(cur_filament_id, spool_id) if cur_filament_id else False
+        if cur_filament_id and not shared:
+            # Singleton filament — PATCH it in place so the user's edit lands
+            # on the row their spool already points at instead of orphaning it.
+            patch_body: dict = {
+                "name": desired_name,
+                "material": material,
+                "color_hex": color_hex,
+                "weight": float(label_weight),
+            }
+            if brand:
+                vendor_id = await client.find_or_create_vendor(brand)
+                patch_body["vendor_id"] = vendor_id
+            async with _translate_spoolman_errors():
+                await client.patch_filament(cur_filament_id, patch_body)
+            filament_id = cur_filament_id
+        else:
+            # Filament is shared with other spools — PATCHing it in place would
+            # silently rewrite their metadata too. Fall back to find-or-create
+            # so only this spool's link moves.
+            async with _translate_spoolman_errors():
+                filament_id = await client.find_or_create_filament(
+                    material=material,
+                    subtype=subtype or "",
+                    brand=brand,
+                    color_hex=color_hex,
+                    label_weight=label_weight,
+                    color_name=color_name,
+                )
     if not filament_id:
         raise HTTPException(status_code=500, detail="Failed to find or create filament in Spoolman")
 
@@ -627,28 +856,37 @@ async def update_spool(
                 clear_location=storage_location_changed and not storage_location,
             )
 
-    # Persist BambuStudio slicer preset under the spool's extra dict.
-    # Spoolman doesn't have a native field for this, so we round-trip via
-    # extra and unpack in _map_spoolman_spool. Only writes when the request
+    # Persist BambuStudio slicer preset AND color_name under spool.extra.
+    # Spoolman has no native fields for these — color_name was confirmed
+    # absent from the FilamentUpdateParameters schema in 0.23.1 (#1357), so
+    # writing `filament.color_name` was a silent no-op that left every
+    # edit looking "not saved". They all round-trip via extra and get
+    # unpacked in _map_spoolman_spool. Only writes when the request
     # explicitly set the field — passing null/omitting leaves the existing
     # extra entry untouched (write empty string to clear).
     sf_set = "slicer_filament" in data.model_fields_set
     sfn_set = "slicer_filament_name" in data.model_fields_set
-    if sf_set or sfn_set:
+    cn_set = "color_name" in data.model_fields_set
+    if sf_set or sfn_set or cn_set:
         # Ensure extra fields are registered (Spoolman rejects PATCHes with
         # unknown keys with HTTP 400). Idempotent if startup already ran this.
         if sf_set:
             await client.ensure_extra_field("bambu_slicer_filament")
         if sfn_set:
             await client.ensure_extra_field("bambu_slicer_filament_name")
+        if cn_set:
+            await client.ensure_extra_field("bambu_color_name")
         new_extra: dict = {}
         if sf_set:
             new_extra["bambu_slicer_filament"] = json.dumps(data.slicer_filament or "")
         if sfn_set:
             new_extra["bambu_slicer_filament_name"] = json.dumps(data.slicer_filament_name or "")
+        if cn_set:
+            new_extra["bambu_color_name"] = json.dumps(data.color_name or "")
         async with _translate_spoolman_errors():
             updated = await client.merge_spool_extra(spool_id, new_extra)
 
+    await ws_manager.broadcast({"type": "inventory_changed"})
     return _map_spoolman_spool(updated)
 
 
@@ -662,6 +900,7 @@ async def delete_spool(
     client = await _get_client(db)
     async with _translate_spoolman_errors():
         await client.delete_spool(spool_id)
+    await ws_manager.broadcast({"type": "inventory_changed"})
     return {"status": "deleted"}
 
 
@@ -676,10 +915,12 @@ async def archive_spool(
     async with _translate_spoolman_errors():
         spool = await client.set_spool_archived(spool_id, archived=True)
     try:
-        return _map_spoolman_spool(spool)
+        mapped = _map_spoolman_spool(spool)
     except ValueError as exc:
         logger.warning("Malformed Spoolman spool (id=%r): %s", spool_id, exc)
         raise HTTPException(status_code=502, detail="Spoolman returned malformed spool data") from exc
+    await ws_manager.broadcast({"type": "inventory_changed"})
+    return mapped
 
 
 @router.post("/spools/{spool_id}/restore")
@@ -693,10 +934,191 @@ async def restore_spool(
     async with _translate_spoolman_errors():
         spool = await client.set_spool_archived(spool_id, archived=False)
     try:
-        return _map_spoolman_spool(spool)
+        mapped = _map_spoolman_spool(spool)
     except ValueError as exc:
         logger.warning("Malformed Spoolman spool (id=%r): %s", spool_id, exc)
         raise HTTPException(status_code=502, detail="Spoolman returned malformed spool data") from exc
+    await ws_manager.broadcast({"type": "inventory_changed"})
+    return mapped
+
+
+@router.post("/spools/{spool_id}/reset-consumed-counter")
+async def reset_spool_consumed_counter(
+    spool_id: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
+) -> dict:
+    """Zero the displayed "Total Consumed" counter for a Spoolman spool.
+
+    Spoolman doesn't have a native "baseline" field, so the implementation
+    reaches for the closest equivalent: PATCH `used_weight=0` upstream.
+    The read mapping in ``_map_spoolman_spool`` then derives Bambuddy's
+    `weight_used = label - remaining_weight` and `baseline = weight_used -
+    real_used_weight`, so the Inventory page's `weight_used - baseline`
+    display lands at 0 while remaining (= label - weight_used) is preserved
+    — parity with the internal-mode endpoint (#1390, see also
+    ``backend/app/api/routes/inventory.py::reset_spool_consumed_counter``).
+    """
+    client = await _get_client(db)
+    async with _translate_spoolman_errors():
+        spool = await client.reset_spool_usage(spool_id)
+    try:
+        mapped = _map_spoolman_spool(spool)
+    except ValueError as exc:
+        logger.warning("Malformed Spoolman spool (id=%r): %s", spool_id, exc)
+        raise HTTPException(status_code=502, detail="Spoolman returned malformed spool data") from exc
+    await ws_manager.broadcast({"type": "inventory_changed"})
+    return mapped
+
+
+class SpoolmanBulkUpdateRequest(BaseModel):
+    ids: list[int] = Field(..., min_length=1, max_length=500)
+    update: SpoolmanInventoryUpdate
+
+
+class SpoolmanBulkIdsRequest(BaseModel):
+    ids: list[int] = Field(..., min_length=1, max_length=500)
+
+
+@router.post("/spools/bulk-update")
+async def bulk_update_spools(
+    payload: SpoolmanBulkUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
+) -> dict:
+    """Apply the same partial update to every listed Spoolman spool.
+
+    Loops the per-spool ``update_spool`` route so the filament re-linking +
+    extra-dict + location-resolution rules stay in sync with the single-spool
+    PATCH path. Per-spool errors are collected; one bad ID doesn't abort the
+    batch.
+    """
+    update_fields = payload.update.model_dump(exclude_unset=True)
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="update must include at least one field")
+
+    updated = 0
+    errors: list[dict] = []
+    for sid in payload.ids:
+        try:
+            await update_spool(spool_id=sid, data=payload.update, db=db, _=None)
+            updated += 1
+        except HTTPException as exc:
+            errors.append({"id": sid, "status": exc.status_code, "detail": exc.detail})
+        except Exception as exc:  # noqa: BLE001 — surface unexpected failures per-row
+            logger.exception("Spoolman bulk-update failed for spool %s", sid)
+            errors.append({"id": sid, "status": 500, "detail": str(exc)})
+    if updated:
+        await ws_manager.broadcast({"type": "inventory_changed"})
+    return {"updated": updated, "errors": errors}
+
+
+@router.post("/spools/bulk-delete")
+async def bulk_delete_spools(
+    payload: SpoolmanBulkIdsRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
+) -> dict:
+    """Hard-delete every listed Spoolman spool. Per-spool failures are collected."""
+    client = await _get_client(db)
+    deleted = 0
+    errors: list[dict] = []
+    for sid in payload.ids:
+        try:
+            async with _translate_spoolman_errors():
+                await client.delete_spool(sid)
+            deleted += 1
+        except HTTPException as exc:
+            errors.append({"id": sid, "status": exc.status_code, "detail": exc.detail})
+        except Exception as exc:  # noqa: BLE001 — surface unexpected failures per-row
+            logger.exception("Spoolman bulk-delete failed for spool %s", sid)
+            errors.append({"id": sid, "status": 500, "detail": str(exc)})
+    if deleted:
+        await ws_manager.broadcast({"type": "inventory_changed"})
+    return {"deleted": deleted, "errors": errors}
+
+
+@router.post("/spools/bulk-archive")
+async def bulk_archive_spools(
+    payload: SpoolmanBulkIdsRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
+) -> dict:
+    """Archive every listed Spoolman spool. Per-spool failures are collected."""
+    client = await _get_client(db)
+    archived = 0
+    errors: list[dict] = []
+    for sid in payload.ids:
+        try:
+            async with _translate_spoolman_errors():
+                await client.set_spool_archived(sid, archived=True)
+            archived += 1
+        except HTTPException as exc:
+            errors.append({"id": sid, "status": exc.status_code, "detail": exc.detail})
+        except Exception as exc:  # noqa: BLE001 — surface unexpected failures per-row
+            logger.exception("Spoolman bulk-archive failed for spool %s", sid)
+            errors.append({"id": sid, "status": 500, "detail": str(exc)})
+    if archived:
+        await ws_manager.broadcast({"type": "inventory_changed"})
+    return {"archived": archived, "errors": errors}
+
+
+@router.post("/spools/bulk-restore")
+async def bulk_restore_spools(
+    payload: SpoolmanBulkIdsRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
+) -> dict:
+    """Restore every listed archived Spoolman spool. Per-spool failures are collected."""
+    client = await _get_client(db)
+    restored = 0
+    errors: list[dict] = []
+    for sid in payload.ids:
+        try:
+            async with _translate_spoolman_errors():
+                await client.set_spool_archived(sid, archived=False)
+            restored += 1
+        except HTTPException as exc:
+            errors.append({"id": sid, "status": exc.status_code, "detail": exc.detail})
+        except Exception as exc:  # noqa: BLE001 — surface unexpected failures per-row
+            logger.exception("Spoolman bulk-restore failed for spool %s", sid)
+            errors.append({"id": sid, "status": 500, "detail": str(exc)})
+    if restored:
+        await ws_manager.broadcast({"type": "inventory_changed"})
+    return {"restored": restored, "errors": errors}
+
+
+@router.post("/spools/reset-consumed-counter-bulk")
+async def bulk_reset_spool_consumed_counter(
+    payload: dict = Body(...),
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
+) -> dict:
+    """Bulk reset the "Total Consumed" counter across the given Spoolman spool IDs.
+
+    Caller passes an explicit list of IDs — no "reset all" shortcut, since
+    a typo on a wildcard would wipe the entire inventory's tracking.
+    Returns the count of spools successfully reset; individual failures are
+    logged but do not abort the batch.
+    """
+    spool_ids = payload.get("spool_ids")
+    if not isinstance(spool_ids, list) or not spool_ids:
+        raise HTTPException(status_code=400, detail="spool_ids must be a non-empty list")
+    if not all(isinstance(sid, int) for sid in spool_ids):
+        raise HTTPException(status_code=400, detail="spool_ids must contain integers")
+
+    client = await _get_client(db)
+    reset_count = 0
+    for spool_id in spool_ids:
+        try:
+            async with _translate_spoolman_errors():
+                await client.reset_spool_usage(spool_id)
+            reset_count += 1
+        except HTTPException as exc:
+            logger.warning("Spoolman reset-consumed-counter failed for spool %s: %s", spool_id, exc.detail)
+    if reset_count:
+        await ws_manager.broadcast({"type": "inventory_changed"})
+    return {"reset": reset_count}
 
 
 @router.patch("/spools/{spool_id}/weight")
@@ -729,7 +1151,20 @@ async def sync_spool_weight(
     upd_filament = updated.get("filament") or {}
     label_weight = _safe_int(upd_filament.get("weight"), 1000)
     weight_used = max(0.0, label_weight - remaining)
+    await ws_manager.broadcast({"type": "inventory_changed"})
     return {"status": "ok", "weight_used": weight_used}
+
+
+def _extra_tag(spool: dict) -> str:
+    """The tag stored in a Spoolman spool's ``extra``, normalised for comparison.
+
+    Anything that is not a string reads as no tag. ``extra`` is free-form and
+    edited outside Bambuddy, and ``.get("tag", "")`` does not default a key
+    that is present and null -- that returns None, which has no ``.strip``.
+    """
+    extra = spool.get("extra")
+    raw = extra.get("tag") if isinstance(extra, dict) else None
+    return raw.strip('"').upper() if isinstance(raw, str) else ""
 
 
 @router.patch("/spools/{spool_id}/tag")
@@ -743,8 +1178,10 @@ async def link_tag_to_spoolman_spool(
     """Write an NFC tag UID or Bambu tray UUID into Spoolman's extra.tag for a spool.
 
     tray_uuid takes precedence over tag_uid when both are supplied.
-    Returns 409 if another spool already carries the same tag.
     Uses extra_lock to serialise against concurrent extra-field writes.
+
+    A tag another active spool already carries is refused with the shared
+    ``tag_already_linked`` 409, identical to the built-in route's (#3110).
     """
     client = await _get_client(db)
     tag = (data.tray_uuid or data.tag_uid).upper()
@@ -752,15 +1189,25 @@ async def link_tag_to_spoolman_spool(
 
     async with client.extra_lock(spool_id):
         # Duplicate check: scan all spools for the same tag on a different spool.
+        # Sorted, because Spoolman has no unique constraint on extra.tag either,
+        # and a caller offered whichever row the scan happened to reach first
+        # could not tell two holders apart. The built-in route names the lowest
+        # id for the same reason (#3110).
+        #
+        # Sorting means every row is read, where the old loop stopped at its
+        # first match, so one malformed row after the holder must not be able
+        # to take the whole request down: _extra_tag refuses a non-string, and
+        # a row without an integer id cannot be named and so is not treated as
+        # a holder. Bambuddy only ever writes a JSON string here; a third party
+        # editing extra.tag in Spoolman is what puts anything else in reach.
         async with _translate_spoolman_errors():
             all_spools = await client.get_all_spools()
-        for s in all_spools:
-            s_tag = (s.get("extra") or {}).get("tag", "")
-            if s_tag.strip('"').upper() == tag and s.get("id") != spool_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Tag is already assigned to spool {s['id']}",
-                )
+        holders = sorted(
+            (s for s in all_spools if _extra_tag(s) == tag and isinstance(s.get("id"), int) and s["id"] != spool_id),
+            key=lambda s: s["id"],
+        )
+        if holders:
+            raise tag_already_linked("tray_uuid" if data.tray_uuid else "tag_uid", holders[0]["id"])
 
         # Re-fetch inside the lock so cur_extra reflects any concurrent update.
         async with _translate_spoolman_errors():
@@ -771,6 +1218,7 @@ async def link_tag_to_spoolman_spool(
             updated = await client.update_spool_full(spool_id=spool_id, extra=cur_extra)
 
     logger.info("Linked tag %s to Spoolman spool %s", tag, spool_id)
+    await ws_manager.broadcast({"type": "inventory_changed"})
     return _map_spoolman_spool(updated)
 
 
@@ -997,7 +1445,7 @@ async def sync_spoolman_ams_weights(
 async def assign_spoolman_slot(
     body: SpoolSlotAssignmentRequest,
     db: AsyncSession = Depends(get_db),
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
+    current_user: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
 ) -> dict:
     """Assign a Spoolman spool to a printer AMS slot (stored in local DB only).
 
@@ -1040,6 +1488,19 @@ async def assign_spoolman_slot(
         logger.error("Failed to persist slot assignment: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to save slot assignment") from exc
 
+    # #1457: clear stale fallback-tag links on OTHER spools still bound to this
+    # slot. Without this, a non-RFID slot's deterministic fallback tag stays
+    # attached to the previous spool in Spoolman's extra.tag and re-surfaces in
+    # the hover card whenever the local slot assignment is removed.
+    if printer.serial_number:
+        await _clear_stale_slot_fallback_tag_links(
+            client,
+            printer_serial=printer.serial_number,
+            ams_id=body.ams_id,
+            tray_id=body.tray_id,
+            keep_spool_id=body.spoolman_spool_id,
+        )
+
     mapped = _map_spoolman_spool(spool)
 
     # Fetch K-profiles before the MQTT try block so we can use async DB access.
@@ -1055,29 +1516,100 @@ async def assign_spoolman_slot(
     try:
         mqtt_client = printer_manager.get_client(body.printer_id)
         if mqtt_client:
-            tray_type = mapped.get("material") or ""
+            # Spoolman's material is free text, so it arrives as whatever the
+            # user typed there -- "PLA+", "PolyTerra PLA". The sub-brand keeps
+            # that wording; the slot's type has to be one the printer and the
+            # slicer know (issue #2902).
+            material = mapped.get("material") or ""
+            tray_type = printer_filament_type(material)
             brand = mapped.get("brand") or ""
             subtype = mapped.get("subtype") or ""
             if brand:
-                tray_sub_brands = f"{brand} {tray_type} {subtype}".strip()
+                tray_sub_brands = f"{brand} {material} {subtype}".strip()
             elif subtype:
-                tray_sub_brands = f"{tray_type} {subtype}".strip()
+                tray_sub_brands = f"{material} {subtype}".strip()
             else:
-                tray_sub_brands = tray_type
+                tray_sub_brands = material
 
             tray_color = (mapped.get("rgba") or "808080FF").upper()
             if len(tray_color) == 6:
                 tray_color = tray_color + "FF"
 
-            material_upper = tray_type.upper().strip()
-            tray_info_idx = (
-                GENERIC_FILAMENT_IDS.get(material_upper)
-                or GENERIC_FILAMENT_IDS.get(material_upper.split("-")[0].split(" ")[0])
-                or ""
+            # Printer state, read here rather than further down because the
+            # per-model preset override below needs the slot's nozzle
+            # diameter and the K-profile cascade further down needs the same
+            # value -- one read, so they cannot disagree. (The previous
+            # `mqtt_client.printer_state` access via hasattr always returned
+            # None -- the attribute is `state`, not `printer_state` -- so the
+            # K-profile cascade silently skipped state.kprofiles, defaulted
+            # nozzle_diameter to 0.4, and left slot_extruder unset.)
+            state = printer_manager.get_status(body.printer_id)
+            slot_nozzle = resolve_slot_nozzle(
+                state, body.ams_id, body.tray_id, printer_manager.get_model(body.printer_id)
             )
-            setting_id = ""
+            nozzle_diameter = slot_nozzle.diameter
 
-            temp_defaults = MATERIAL_TEMPS.get(material_upper, (200, 240))
+            # Per-printer-model preset override, same cascade as internal
+            # mode: a cloud/Orca preset is bound to a model, so one stored
+            # preset per spool is wrong across two models. Returns Spoolman's
+            # own value when no override is set.
+            slot_slicer_filament, slot_slicer_filament_name = await resolve_spoolman_preset(
+                db,
+                spoolman_spool_id=body.spoolman_spool_id,
+                printer_model=printer_manager.get_model(body.printer_id),
+                nozzle_diameter=nozzle_diameter,
+                fallback_filament=mapped.get("slicer_filament"),
+                fallback_name=mapped.get("slicer_filament_name"),
+            )
+
+            # #1713: resolve the spool's stored slicer_filament reference
+            # (cloud preset, local preset, GF-prefix builtin, or numeric
+            # LocalPreset id) to the printer-side tray_info_idx + setting_id.
+            # Previously the Spoolman path dropped slicer_filament on the
+            # floor and only the generic-material fallback fired; the user-
+            # configured profile never reached the printer. Shared with the
+            # internal-mode route via the same helper so the two flows can't
+            # drift again.
+            tray_info_idx, setting_id, sub_brand_override, type_override = await resolve_slicer_filament(
+                db=db,
+                current_user=current_user,
+                slicer_filament=slot_slicer_filament,
+                slicer_filament_name=slot_slicer_filament_name,
+                material=material,
+            )
+            if sub_brand_override:
+                tray_sub_brands = sub_brand_override
+            # A preset carries its own type; the reduction above only infers
+            # one from Spoolman's free-text material. The preset wins when the
+            # spool has one (issue #2902, @doncaruana).
+            if type_override:
+                tray_type = printer_filament_type(type_override)
+
+            material_upper = material.upper().strip()
+            # Fall back to generic-material id when slicer_filament is empty
+            # or the resolver discarded an unresolvable value. Matches the
+            # internal-mode tail in inventory.py:_apply_spool_to_slot_inner,
+            # including the order: the spool's own wording first and the
+            # reduced type only after it, so "PETG HF" keeps its own generic
+            # preset (GFG96) rather than trading it for "PETG"'s GFG99.
+            if not tray_info_idx:
+                tray_info_idx = (
+                    GENERIC_FILAMENT_IDS.get(material_upper)
+                    or GENERIC_FILAMENT_IDS.get(material_upper.split("-")[0].split(" ")[0])
+                    or GENERIC_FILAMENT_IDS.get(tray_type.upper())
+                    or ""
+                )
+
+            # Ensure setting_id is always derivable from tray_info_idx. The
+            # local-preset path can leave it empty when the LP's setting JSON
+            # has no filament_id and falls through to the generic material id;
+            # without this fallback the slicer gets a half-configured slot
+            # (filament id without setting id) and the slot detail modal
+            # renders empty fields. Same pattern as the internal-mode tail.
+            if tray_info_idx and not setting_id:
+                setting_id = filament_id_to_setting_id(tray_info_idx)
+
+            temp_defaults = nozzle_temp_range(material, tray_type)
             temp_min = mapped.get("nozzle_temp_min") or temp_defaults[0]
             temp_max = temp_defaults[1]
 
@@ -1086,21 +1618,7 @@ async def assign_spoolman_slot(
             # None (the attribute is `state`, not `printer_state`), so the
             # K-profile cascade silently skipped state.kprofiles, defaulted
             # nozzle_diameter to 0.4, and left slot_extruder unset.
-            state = printer_manager.get_status(body.printer_id)
-            nozzle_diameter = "0.4"
-            if state and state.nozzles:
-                nd = state.nozzles[0].nozzle_diameter
-                if nd:
-                    nozzle_diameter = nd
-
-            slot_extruder = None
-            if state and state.ams_extruder_map:
-                if body.ams_id == 255:
-                    # External slots: ext-L (tray 0) → extruder 1, ext-R (tray 1) → extruder 0
-                    # tray_id 0→1, 1→0
-                    slot_extruder = 1 - body.tray_id
-                else:
-                    slot_extruder = state.ams_extruder_map.get(str(body.ams_id))
+            slot_extruder = slot_nozzle.extruder
 
             # Prefer exact extruder match, fall back to extruder-agnostic kp
             # for the same nozzle. Hard-skipping on mismatch silently dropped
@@ -1109,6 +1627,8 @@ async def assign_spoolman_slot(
             fallback_kp = None
             for kp in kp_rows:
                 if kp.nozzle_diameter != nozzle_diameter or kp.cali_idx is None:
+                    continue
+                if not slot_nozzle.flow_matches(kp.nozzle_type):
                     continue
                 if slot_extruder is not None and kp.extruder is not None and kp.extruder == slot_extruder:
                     exact_kp = kp
@@ -1201,29 +1721,21 @@ async def assign_spoolman_slot(
                     body.tray_id,
                 )
             else:
-                # No stored K-profile: preserve the slot's current live cali_idx
-                from backend.app.api.routes.inventory import _find_tray_in_ams_data
-
-                live_tray = None
-                if state and state.raw_data:
-                    ams_raw = state.raw_data.get("ams", [])
-                    if isinstance(ams_raw, dict):
-                        ams_raw = ams_raw.get("ams", [])
-                    live_tray = _find_tray_in_ams_data(ams_raw, body.ams_id, body.tray_id)
-                live_cali_idx = (live_tray or {}).get("cali_idx")
-                if live_cali_idx is not None and live_cali_idx >= 0:
-                    mqtt_client.extrusion_cali_sel(
-                        ams_id=body.ams_id,
-                        tray_id=body.tray_id,
-                        cali_idx=live_cali_idx,
-                        filament_id=effective_tray_info_idx,
-                        nozzle_diameter=nozzle_diameter,
-                    )
-                    logger.info(
-                        "No stored K-profile for Spoolman spool %d — preserved live cali_idx=%d",
-                        body.spoolman_spool_id,
-                        live_cali_idx,
-                    )
+                # No stored K-profile for this spool — always reset the slot to
+                # Default K (cali_idx=-1). The live cali_idx belongs to whatever
+                # filament was there before, so preserving it would apply the
+                # wrong filament's calibration to the new spool.
+                mqtt_client.extrusion_cali_sel(
+                    ams_id=body.ams_id,
+                    tray_id=body.tray_id,
+                    cali_idx=-1,
+                    filament_id=effective_tray_info_idx,
+                    nozzle_diameter=nozzle_diameter,
+                )
+                logger.info(
+                    "No stored K-profile for Spoolman spool %d — reset slot to Default K (cali_idx=-1)",
+                    body.spoolman_spool_id,
+                )
 
             logger.info(
                 "Auto-configured AMS slot ams=%d tray=%d for Spoolman spool %d on printer %d",
@@ -1349,6 +1861,89 @@ def _k_profile_to_dict(p: SpoolmanKProfile) -> dict:
         "setting_id": p.setting_id,
         "created_at": p.created_at,
     }
+
+
+def _filament_preset_to_dict(p: SpoolmanFilamentPreset) -> dict:
+    """Manually map SpoolmanFilamentPreset → SpoolFilamentPresetResponse-compatible dict."""
+    return {
+        "id": p.id,
+        "spool_id": p.spoolman_spool_id,
+        "printer_model": p.printer_model,
+        "nozzle_diameter": p.nozzle_diameter,
+        "slicer_filament": p.slicer_filament,
+        "slicer_filament_name": p.slicer_filament_name,
+        "created_at": p.created_at,
+    }
+
+
+@router.get("/spools/{spool_id}/filament-presets")
+async def get_spoolman_filament_presets(
+    spool_id: int = Path(..., gt=0),
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_READ),
+) -> list[dict]:
+    """Return all per-printer-model preset overrides for a Spoolman spool."""
+    await _get_client(db)
+    result = await db.execute(
+        select(SpoolmanFilamentPreset).where(SpoolmanFilamentPreset.spoolman_spool_id == spool_id)
+    )
+    return [_filament_preset_to_dict(p) for p in result.scalars().all()]
+
+
+@router.put("/spools/{spool_id}/filament-presets")
+async def save_spoolman_filament_presets(
+    spool_id: int = Path(..., gt=0),
+    presets: list[SpoolFilamentPresetBase] = Body(...),
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
+) -> list[dict]:
+    """Replace all per-printer-model preset overrides for a Spoolman spool."""
+    client = await _get_client(db)
+    async with _translate_spoolman_errors():
+        await client.get_spool(spool_id)
+
+    # Same as the internal route: reject a duplicated (model, diameter) before
+    # touching the stored rows, so a bad payload cannot clear what it fails to
+    # replace.
+    seen: set[tuple[str, str]] = set()
+    for preset in presets:
+        key = (preset.printer_model, preset.nozzle_diameter)
+        if key in seen:
+            raise HTTPException(
+                422,
+                f"Duplicate override for model {preset.printer_model!r} nozzle {preset.nozzle_diameter or 'any'!r}",
+            )
+        seen.add(key)
+
+    saved: list[SpoolmanFilamentPreset] = []
+    try:
+        await db.execute(delete(SpoolmanFilamentPreset).where(SpoolmanFilamentPreset.spoolman_spool_id == spool_id))
+        await db.flush()
+        for preset in presets:
+            obj = SpoolmanFilamentPreset(
+                spoolman_spool_id=spool_id,
+                printer_model=preset.printer_model,
+                nozzle_diameter=preset.nozzle_diameter,
+                slicer_filament=preset.slicer_filament,
+                slicer_filament_name=preset.slicer_filament_name,
+            )
+            db.add(obj)
+            saved.append(obj)
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(422, "Duplicate or invalid preset override (check model and nozzle uniqueness)") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        await db.rollback()
+        logger.error("Filament preset save for spool %d failed: %s", spool_id, exc)
+        raise HTTPException(500, "Failed to save filament presets") from exc
+
+    for obj in saved:
+        await db.refresh(obj)
+
+    return [_filament_preset_to_dict(p) for p in saved]
 
 
 def _normalize_filament(raw: dict) -> NormalizedFilament | None:

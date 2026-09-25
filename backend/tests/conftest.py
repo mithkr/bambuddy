@@ -18,6 +18,52 @@ import pytest
 os.environ["LOG_TO_FILE"] = "false"
 os.environ["DEBUG"] = "false"
 
+# Point the app's own engine at a throwaway database before anything reads
+# DATABASE_URL.
+#
+# The fixtures below build their own SQLite engine, but that is not the only
+# engine in play: `core/config.py` snapshots ``DATABASE_URL`` at import time and
+# `core/database.py` builds a module-level ``engine`` / ``async_session`` from
+# it. Any app code that opens its own session rather than receiving the fixture
+# one therefore talks to whatever database the developer's `.env` names. The
+# clearest example is ``run_with_retry`` (used by the print-completion path),
+# whose sessions come from ``backend.app.core.database`` — so the widespread
+# ``patch("backend.app.main.async_session")`` does not intercept them.
+#
+# Left alone that is not a hypothetical: on a plain checkout it means the suite
+# writes to the developer's real SQLite file, and with a PostgreSQL `.env` it
+# means a live install. A completion test calling ``on_print_complete(1, ...)``
+# closed a queue item belonging to an actual running print that way.
+_TEST_APP_DB_DIR = Path(tempfile.mkdtemp(prefix="bambuddy_test_appdb_"))
+APP_DATABASE_URL = f"sqlite+aiosqlite:///{_TEST_APP_DB_DIR / 'app.db'}"
+os.environ["DATABASE_URL"] = APP_DATABASE_URL
+
+
+def _cleanup_test_app_db_dir():
+    shutil.rmtree(_TEST_APP_DB_DIR, ignore_errors=True)
+
+
+atexit.register(_cleanup_test_app_db_dir)
+
+
+def _assert_disposable_database(url, source: str) -> None:
+    """Abort the run unless *url* is the throwaway database created above.
+
+    A guard rather than a comment because the failure it prevents is silent and
+    destructive: the suite would appear to pass while having mutated real print
+    history. Anything that reintroduces a real ``DATABASE_URL`` — an `.env` read
+    later in the import order, a fixture rebuilding the engine — trips this
+    instead of reaching the database.
+    """
+    database = str(getattr(url, "database", "") or "")
+    if not str(getattr(url, "drivername", "")).startswith("sqlite") or not database.startswith(str(_TEST_APP_DB_DIR)):
+        raise RuntimeError(
+            f"Refusing to run tests: {source} resolves to {url!r}, which is not the "
+            f"disposable SQLite database under {_TEST_APP_DB_DIR}. Tests must never "
+            f"open a session against a real Bambuddy database."
+        )
+
+
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
 
@@ -25,6 +71,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from backend.app.core.config import settings  # noqa: E402
 
 settings.log_to_file = False
+if settings.database_url != APP_DATABASE_URL:
+    raise RuntimeError(
+        f"Refusing to run tests: settings.database_url is {settings.database_url!r} "
+        f"rather than the disposable test database. Something read DATABASE_URL "
+        f"before conftest could override it."
+    )
 
 # Use a temp directory for plate calibration to avoid deleting real calibration files
 _test_plate_cal_dir = Path(tempfile.mkdtemp(prefix="bambuddy_test_plate_cal_"))
@@ -39,7 +91,11 @@ def _cleanup_test_plate_cal_dir():
 
 atexit.register(_cleanup_test_plate_cal_dir)
 
-from backend.app.core.database import Base  # noqa: E402
+from backend.app.core.database import Base, engine as _app_engine  # noqa: E402
+
+# The engine is built at import time from the URL above, so this catches the
+# case where that override did not take effect for whatever reason.
+_assert_disposable_database(_app_engine.url, "backend.app.core.database.engine")
 
 # Use in-memory SQLite for tests
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -81,6 +137,63 @@ def mfa_encryption_isolation(monkeypatch, tmp_path):
     enc_mod._key_source = None
 
 
+@pytest.fixture(autouse=True)
+def reset_spoolman_location_sync_cache():
+    """Drop the per-URL Spoolman location-sync TTL cache between tests.
+
+    Without this, a test that runs the sync against `http://localhost:7912`
+    will skip the sync in any later test that uses the same URL within 60
+    real seconds — test ordering would then leak assertions across runs."""
+    from backend.app.services.location_service import _spoolman_location_sync_cache_clear
+
+    _spoolman_location_sync_cache_clear()
+    yield
+    _spoolman_location_sync_cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def reset_auth_enabled_cache():
+    """Drop the module-level auth-enabled cache between tests (issue #2572).
+
+    ``is_auth_enabled`` caches an enabled=True result for a TTL. Without this
+    reset a test that enables auth would leave ``True`` cached, so a later test
+    running in auth-disabled mode (without going through ``set_auth_enabled``)
+    would wrongly see auth as enabled until the TTL expired — order-dependent
+    flakiness."""
+    from backend.app.core.auth import invalidate_auth_enabled_cache
+
+    invalidate_auth_enabled_cache()
+    yield
+    invalidate_auth_enabled_cache()
+
+
+@pytest.fixture(autouse=True)
+def disconnect_printers_registered_during_a_test():
+    """Give every test an empty ``printer_manager`` singleton.
+
+    ``POST /api/v1/printers`` really calls ``connect_printer``, so a test that
+    creates a printer through the API parks a live client in the singleton --
+    and the singleton outlives the per-test in-memory database. The next test
+    on the same xdist worker gets a fresh database whose first printer is handed
+    the same primary key, and reads that leftover client as its own live status.
+    ``test_scheduled_drying_routes`` saw exactly that: an "online" printer with
+    no firmware version, so scheduling a dry came back 400 instead of 200.
+
+    Snapshotting the ids at test entry was insufficient: a client leaked by a
+    previous module became part of that snapshot and therefore survived every
+    later cleanup on the same xdist worker. Clear both before and after each
+    test. ``disconnect_printer`` also clears model/printer-info caches and stops
+    any paho thread owned by the leaked client.
+    """
+    from backend.app.services.printer_manager import printer_manager
+
+    for printer_id in list(printer_manager._clients):
+        printer_manager.disconnect_printer(printer_id)
+    yield
+    for printer_id in list(printer_manager._clients):
+        printer_manager.disconnect_printer(printer_id)
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     """Create an instance of the default event loop for each test session."""
@@ -102,6 +215,7 @@ async def test_engine():
 
     # Import all models to register them
     from backend.app.models import (
+        active_print_session,  # noqa: F401
         ams_history,
         ams_label,
         api_key,
@@ -116,17 +230,21 @@ async def test_engine():
         notification,
         notification_template,
         oidc_provider,
+        print_log,
         print_queue,
         printer,
         project,
         project_bom,
+        scheduled_drying,
         settings,
         slot_preset,
         smart_plug,
         smart_plug_energy_snapshot,  # noqa: F401
+        sponsor_toast_state,  # noqa: F401
         spool,
         spool_assignment,
         spool_catalog,
+        spool_filament_preset,
         spool_k_profile,
         spool_usage_history,
         spoolbuddy_device,
@@ -171,8 +289,17 @@ async def async_client(test_engine, db_session) -> AsyncGenerator[AsyncClient, N
     test_async_session = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
 
     async def override_get_db():
+        # Mirror production get_db (core/database.py): commit on success,
+        # rollback on error. Endpoints that rely on the request-scoped
+        # implicit commit (e.g. create_project, which only flushes) would
+        # otherwise silently lose their writes in tests (#1897).
         async with test_async_session() as session:
-            yield session
+            try:
+                yield session
+                await session.commit()
+            except BaseException:
+                await session.rollback()
+                raise
 
     app.dependency_overrides[get_db] = override_get_db
 
@@ -185,6 +312,9 @@ async def async_client(test_engine, db_session) -> AsyncGenerator[AsyncClient, N
         patch("backend.app.core.database.async_session", test_async_session),
         patch("backend.app.core.auth.async_session", test_async_session),
         patch("backend.app.main.async_session", test_async_session),
+        # Obico endpoints load settings through the service's module-level binding;
+        # without this patch they'd read whatever DB the cwd resolves to (#1546).
+        patch("backend.app.services.obico_detection.async_session", test_async_session),
         patch("backend.app.main.init_printer_connections", mock_init_printer_connections),
     ):
         # Seed default groups for tests that need them
@@ -460,6 +590,32 @@ def printer_factory(db_session):
 
 
 @pytest.fixture
+def location_factory(db_session):
+    _counter = [0]
+
+    async def _create_location(**kwargs):
+        from backend.app.models.location import Location
+
+        _counter[0] += 1
+        counter = _counter[0]
+
+        name = kwargs.pop("name", f"Test Location {counter}")
+        defaults = {
+            "name": name,
+            "name_key": name.strip().lower(),
+        }
+        defaults.update(kwargs)
+
+        location = Location(**defaults)
+        db_session.add(location)
+        await db_session.commit()
+        await db_session.refresh(location)
+        return location
+
+    return _create_location
+
+
+@pytest.fixture
 def notification_provider_factory(db_session):
     """Factory to create test notification providers."""
 
@@ -481,6 +637,7 @@ def notification_provider_factory(db_session):
             "on_print_stopped": True,
             "on_print_progress": False,
             "on_print_missing_spool_assignment": False,
+            "on_billing_charge_failed": True,
             "on_printer_offline": False,
             "on_printer_error": False,
             "on_filament_low": False,
@@ -504,10 +661,21 @@ def notification_provider_factory(db_session):
 
 @pytest.fixture
 def archive_factory(db_session):
-    """Factory to create test archives."""
+    """Factory to create test archives.
+
+    Also synthesizes one PrintLogEntry per archive (matching the production
+    flow where statistics are aggregated from PrintLogEntry, not PrintArchive,
+    per #1378). Pass ``with_run=False`` to skip — useful for testing the
+    "archived but never printed" state. Pass ``run_status=...`` to override
+    the run's status independently of the archive's status field.
+    """
 
     async def _create_archive(printer_id: int, **kwargs):
         from backend.app.models.archive import PrintArchive
+        from backend.app.models.print_log import PrintLogEntry
+
+        with_run = kwargs.pop("with_run", True)
+        run_status = kwargs.pop("run_status", None)
 
         defaults = {
             "printer_id": printer_id,
@@ -526,6 +694,34 @@ def archive_factory(db_session):
         db_session.add(archive)
         await db_session.commit()
         await db_session.refresh(archive)
+
+        if with_run:
+            duration = None
+            if archive.started_at and archive.completed_at:
+                duration = int((archive.completed_at - archive.started_at).total_seconds()) or None
+            run = PrintLogEntry(
+                archive_id=archive.id,
+                printer_id=archive.printer_id,
+                status=run_status or archive.status,
+                started_at=archive.started_at,
+                completed_at=archive.completed_at,
+                duration_seconds=duration,
+                filament_type=archive.filament_type,
+                filament_color=archive.filament_color,
+                filament_used_grams=archive.filament_used_grams,
+                cost=archive.cost,
+                energy_kwh=archive.energy_kwh,
+                energy_cost=archive.energy_cost,
+                failure_reason=archive.failure_reason,
+                print_name=archive.print_name,
+                created_by_id=archive.created_by_id,
+                # Sync the event's created_at with the archive's so date-range
+                # filtered tests that backdate an archive still find its event.
+                created_at=archive.created_at,
+            )
+            db_session.add(run)
+            await db_session.commit()
+
         return archive
 
     return _create_archive

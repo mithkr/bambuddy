@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Plus, Edit2, Trash2, Globe, Check, X, RefreshCw, ExternalLink } from 'lucide-react';
+import { Plus, Edit2, Trash2, Globe, Check, X, RefreshCw, ExternalLink, ImageOff, Lock } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { api } from '../api/client';
 import type { Group, OIDCProvider, OIDCProviderCreate } from '../api/client';
@@ -23,6 +23,7 @@ const EMPTY_FORM: OIDCProviderCreate = {
   require_email_verified: true,
   icon_url: undefined,
   default_group_id: null,
+  is_autologin: false,
 };
 
 // ─── Provider form (create / edit) ───────────────────────────────────────────
@@ -68,7 +69,7 @@ function ProviderForm({
     requireEmailVerifiedDesc = t('settings.oidc.form.requireEmailVerifiedDesc');
   } else {
     requireEmailVerifiedDesc = (
-      <span className="text-red-400">{t('settings.oidc.form.requireEmailVerifiedWarning')}</span>
+      <span className="text-red-700 dark:text-red-400">{t('settings.oidc.form.requireEmailVerifiedWarning')}</span>
     );
   }
 
@@ -76,21 +77,21 @@ function ProviderForm({
     <div className="space-y-4">
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div>
-          <label className={labelCls}>{t('settings.oidc.form.name')} <span className="text-red-400">*</span></label>
+          <label className={labelCls}>{t('settings.oidc.form.name')} <span className="text-red-700 dark:text-red-400">*</span></label>
           <input className={inputCls} value={form.name} onChange={(e) => set('name', e.target.value)} placeholder="Google" />
         </div>
         <div>
-          <label className={labelCls}>{t('settings.oidc.form.issuerUrl')} <span className="text-red-400">*</span></label>
+          <label className={labelCls}>{t('settings.oidc.form.issuerUrl')} <span className="text-red-700 dark:text-red-400">*</span></label>
           <input className={inputCls} value={form.issuer_url} onChange={(e) => set('issuer_url', e.target.value)} placeholder="https://accounts.google.com" />
         </div>
         <div>
-          <label className={labelCls}>{t('settings.oidc.form.clientId')} <span className="text-red-400">*</span></label>
+          <label className={labelCls}>{t('settings.oidc.form.clientId')} <span className="text-red-700 dark:text-red-400">*</span></label>
           <input className={inputCls} value={form.client_id} onChange={(e) => set('client_id', e.target.value)} placeholder="your-client-id" />
         </div>
         <div>
           <label className={labelCls}>
             {t('settings.oidc.form.clientSecret')}
-            {!isEdit && <span className="text-red-400"> *</span>}
+            {!isEdit && <span className="text-red-700 dark:text-red-400"> *</span>}
             {isEdit && <span className="text-bambu-gray text-xs ml-1">({t('settings.oidc.form.secretHint')})</span>}
           </label>
           <input
@@ -110,7 +111,12 @@ function ProviderForm({
         </div>
         <div>
           <label className={labelCls}>{t('settings.oidc.form.iconUrl')}</label>
-          <input className={inputCls} value={form.icon_url ?? ''} onChange={(e) => set('icon_url', e.target.value || undefined)} placeholder="https://..." />
+          <input
+            className={inputCls}
+            value={form.icon_url ?? ''}
+            onChange={(e) => set('icon_url', e.target.value === '' ? null : e.target.value)}
+            placeholder="https://..."
+          />
         </div>
       </div>
 
@@ -144,6 +150,13 @@ function ProviderForm({
             <p className="text-bambu-gray text-xs">{requireEmailVerifiedDesc}</p>
           </div>
         </label>
+        <label className="flex items-center gap-3 cursor-pointer w-full">
+          <Toggle checked={form.is_autologin ?? false} onChange={(v) => set('is_autologin', v)} />
+          <div>
+            <p className="text-white text-sm">{t('settings.oidc.form.autologin')}</p>
+            <p className="text-bambu-gray text-xs">{t('settings.oidc.form.autologinDesc')}</p>
+          </div>
+        </label>
       </div>
 
       <div>
@@ -156,7 +169,7 @@ function ProviderForm({
         />
         <p className="text-bambu-gray text-xs mt-1">{t('settings.oidc.form.emailClaimDesc')}</p>
         {autoLinkOn && form.email_claim !== 'email' && (
-          <p className="text-yellow-400 text-xs mt-1">{t('settings.oidc.form.emailClaimCustomClaimAutoLinkWarning')}</p>
+          <p className="text-yellow-700 dark:text-yellow-400 text-xs mt-1">{t('settings.oidc.form.emailClaimCustomClaimAutoLinkWarning')}</p>
         )}
       </div>
 
@@ -188,6 +201,35 @@ function ProviderForm({
           {isPending ? t('common.saving') : t('common.save')}
         </Button>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Per-provider icon avatar in the admin Settings list (#1333 review).
+ *
+ * Extracted so each card has its own `iconFailed` state. Previously
+ * `onError` just set `display: none` and the admin saw an unexplained gap
+ * where the icon should be — now we swap in the Globe fallback exactly
+ * like the `has_icon === false` branch, so the visual state is
+ * self-explanatory regardless of why the icon didn't load.
+ */
+function ProviderIconAvatar({ provider }: { provider: OIDCProvider }) {
+  const [iconFailed, setIconFailed] = useState(false);
+  const showIcon = provider.has_icon && !iconFailed;
+  if (showIcon) {
+    return (
+      <img
+        src={api.oidcProviderIconUrl(provider.id)}
+        alt={provider.name}
+        className="w-8 h-8 rounded object-contain"
+        onError={() => setIconFailed(true)}
+      />
+    );
+  }
+  return (
+    <div className="w-8 h-8 rounded-full bg-bambu-dark-tertiary flex items-center justify-center">
+      <Globe className="w-4 h-4 text-bambu-gray" />
     </div>
   );
 }
@@ -239,6 +281,28 @@ export function OIDCProviderSettings() {
       queryClient.invalidateQueries({ queryKey: ['oidc-providers-all'] });
       setDeleteTarget(null);
       showToast(t('settings.oidc.deleted'), 'success');
+    },
+    onError: (e: Error) => showToast(e.message, 'error'),
+  });
+
+  // Icon-proxy mutations (#1333). Refresh re-fetches from the stored
+  // icon_url; remove clears the cached bytes but keeps icon_url.
+  const refreshIconMutation = useMutation({
+    mutationFn: (id: number) => api.refreshOIDCProviderIcon(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['oidc-providers-all'] });
+      queryClient.invalidateQueries({ queryKey: ['oidc-providers'] });
+      showToast(t('settings.oidc.iconRefreshed'), 'success');
+    },
+    onError: (e: Error) => showToast(e.message || t('settings.oidc.iconFetchFailed'), 'error'),
+  });
+
+  const removeIconMutation = useMutation({
+    mutationFn: (id: number) => api.deleteOIDCProviderIcon(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['oidc-providers-all'] });
+      queryClient.invalidateQueries({ queryKey: ['oidc-providers'] });
+      showToast(t('settings.oidc.iconRemoved'), 'success');
     },
     onError: (e: Error) => showToast(e.message, 'error'),
   });
@@ -309,23 +373,22 @@ export function OIDCProviderSettings() {
         <Card key={provider.id}>
           <CardHeader>
             <div className="flex items-center gap-3">
-              {provider.icon_url ? (
-                <img src={provider.icon_url} alt={provider.name} className="w-8 h-8 rounded object-contain" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }} />
-              ) : (
-                <div className="w-8 h-8 rounded-full bg-bambu-dark-tertiary flex items-center justify-center">
-                  <Globe className="w-4 h-4 text-bambu-gray" />
-                </div>
-              )}
+              <ProviderIconAvatar provider={provider} />
               <div className="flex-1">
                 <div className="flex items-center gap-2">
                   <h4 className="text-white font-medium">{provider.name}</h4>
                   {provider.is_enabled ? (
-                    <span className="flex items-center gap-1 text-xs text-green-400 bg-green-400/10 px-2 py-0.5 rounded-full">
+                    <span className="flex items-center gap-1 text-xs text-green-700 dark:text-green-400 bg-green-50 dark:bg-green-400/10 px-2 py-0.5 rounded-full">
                       <Check className="w-3 h-3" /> {t('common.enabled')}
                     </span>
                   ) : (
                     <span className="flex items-center gap-1 text-xs text-bambu-gray bg-bambu-dark-tertiary px-2 py-0.5 rounded-full">
                       <X className="w-3 h-3" /> {t('common.disabled')}
+                    </span>
+                  )}
+                  {provider.is_env_managed && (
+                    <span className="flex items-center gap-1 text-xs text-bambu-green">
+                      <Lock className="w-3 h-3" /> {t('settings.environmentManagedLabel')}
                     </span>
                   )}
                 </div>
@@ -335,21 +398,59 @@ export function OIDCProviderSettings() {
                 </div>
               </div>
               <div className="flex items-center gap-2">
-                <Toggle
-                  checked={provider.is_enabled}
-                  onChange={() => toggleEnabled(provider)}
-                  disabled={updateMutation.isPending}
-                />
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => setEditingId(editingId === provider.id ? null : provider.id)}
-                >
-                  <Edit2 className="w-4 h-4" />
-                </Button>
-                <Button variant="danger" size="sm" onClick={() => setDeleteTarget(provider)}>
-                  <Trash2 className="w-4 h-4" />
-                </Button>
+                {/* #2593: startup rewrites the env-managed row from BAMBUDDY_OIDC_*
+                    and the API answers 409, so offering any of these would promise
+                    a change that cannot land -- the icon routes included, where the
+                    click only ever produced an error toast. */}
+                {!provider.is_env_managed && (
+                  <>
+                    {provider.icon_url && (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => refreshIconMutation.mutate(provider.id)}
+                        disabled={refreshIconMutation.isPending}
+                        title={t('settings.oidc.refreshIcon')}
+                        data-testid={`refresh-icon-${provider.id}`}
+                      >
+                        <RefreshCw className={`w-4 h-4 ${refreshIconMutation.isPending ? 'animate-spin' : ''}`} />
+                      </Button>
+                    )}
+                    {provider.has_icon && (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => removeIconMutation.mutate(provider.id)}
+                        disabled={removeIconMutation.isPending}
+                        title={t('settings.oidc.removeIcon')}
+                        data-testid={`remove-icon-${provider.id}`}
+                      >
+                        <ImageOff className="w-4 h-4" />
+                      </Button>
+                    )}
+                    <Toggle
+                      checked={provider.is_enabled}
+                      onChange={() => toggleEnabled(provider)}
+                      disabled={updateMutation.isPending}
+                    />
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => setEditingId(editingId === provider.id ? null : provider.id)}
+                      data-testid={`edit-provider-${provider.id}`}
+                    >
+                      <Edit2 className="w-4 h-4" />
+                    </Button>
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      onClick={() => setDeleteTarget(provider)}
+                      data-testid={`delete-provider-${provider.id}`}
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </Button>
+                  </>
+                )}
               </div>
             </div>
           </CardHeader>
@@ -373,6 +474,7 @@ export function OIDCProviderSettings() {
                     require_email_verified: provider.require_email_verified,
                     icon_url: provider.icon_url ?? undefined,
                     default_group_id: provider.default_group_id ?? null,
+                    is_autologin: provider.is_autologin,
                   }}
                   onSave={(data) => updateMutation.mutate({ id: provider.id, data })}
                   onCancel={() => setEditingId(null)}
@@ -395,13 +497,13 @@ export function OIDCProviderSettings() {
                 </div>
                 <div>
                   <dt className="text-bambu-gray">{t('settings.oidc.form.autoCreate')}</dt>
-                  <dd className={provider.auto_create_users ? 'text-green-400' : 'text-bambu-gray'}>
+                  <dd className={provider.auto_create_users ? 'text-green-700 dark:text-green-400' : 'text-bambu-gray'}>
                     {provider.auto_create_users ? t('common.yes') : t('common.no')}
                   </dd>
                 </div>
                 <div>
                   <dt className="text-bambu-gray">{t('settings.oidc.form.autoLink')}</dt>
-                  <dd className={provider.auto_link_existing_accounts ? 'text-green-400' : 'text-bambu-gray'}>
+                  <dd className={provider.auto_link_existing_accounts ? 'text-green-700 dark:text-green-400' : 'text-bambu-gray'}>
                     {provider.auto_link_existing_accounts ? t('common.yes') : t('common.no')}
                   </dd>
                 </div>
@@ -411,7 +513,7 @@ export function OIDCProviderSettings() {
                 </div>
                 <div>
                   <dt className="text-bambu-gray">{t('settings.oidc.form.requireEmailVerified')}</dt>
-                  <dd className={provider.require_email_verified ? 'text-green-400' : 'text-red-400'}>
+                  <dd className={provider.require_email_verified ? 'text-green-700 dark:text-green-400' : 'text-red-700 dark:text-red-400'}>
                     {provider.require_email_verified ? t('common.yes') : t('common.no')}
                   </dd>
                 </div>

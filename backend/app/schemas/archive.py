@@ -1,16 +1,28 @@
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
+
+from backend.app.utils.filename import clean_display_name
+
+# Free text, punctuation and all -- only control characters are taken out, and
+# only on the way in (#2832). Anything that turns a name into a path sanitises
+# it there instead, where the budget and the fallback are known.
+DisplayName = Annotated[str | None, BeforeValidator(clean_display_name)]
 
 
 class ArchiveBase(BaseModel):
-    print_name: str | None = None
+    print_name: DisplayName = None
     is_favorite: bool | None = None
     tags: str | None = None
     notes: str | None = None
     cost: float | None = None
     failure_reason: str | None = None
-    quantity: int | None = None  # Number of items printed
+    # Number of items printed. 0 is a legal answer -- a plate that jammed and
+    # came off ruined produced nothing, and the project's completed-items count
+    # sums this column (#3051). Bounded for the same reason as the grams below:
+    # it feeds project totals, and a negative would subtract from them.
+    quantity: Annotated[int | None, Field(ge=0, le=10_000)] = None
     # User-defined link (Printables, Thingiverse, etc.)
     external_url: str | None = None
 
@@ -20,6 +32,12 @@ class ArchiveUpdate(ArchiveBase):
     project_id: int | None = None
     # Allow changing status (e.g., clearing failed flag)
     status: str | None = None
+    # Editable because a print archived without its 3MF has no figure at all,
+    # and nothing else can supply one after the fact -- rescan needs a file
+    # this archive does not have (#1820). Bounded because it feeds the filament
+    # totals: 100 kg is far past any single print and well short of a value
+    # that would swamp a chart.
+    filament_used_grams: Annotated[float | None, Field(ge=0, le=100_000)] = None
 
 
 class ArchiveDuplicate(BaseModel):
@@ -27,7 +45,7 @@ class ArchiveDuplicate(BaseModel):
 
     id: int
     print_name: str | None
-    created_at: datetime
+    created_at: datetime | None
     match_type: str  # "exact" (hash match) or "similar" (name match)
 
 
@@ -55,6 +73,7 @@ class ArchiveResponse(BaseModel):
     object_count: int | None = None
 
     print_name: str | None
+    plate_id: int | None = None  # Selected plate of a multi-plate 3MF (#2603)
     print_time_seconds: int | None  # Estimated time from slicer
     actual_time_seconds: int | None = None  # Computed from started_at/completed_at
     # Percentage: 100 = perfect, >100 = faster than estimated
@@ -94,11 +113,20 @@ class ArchiveResponse(BaseModel):
     energy_kwh: float | None = None
     energy_cost: float | None = None
 
-    created_at: datetime
+    created_at: datetime | None
 
     # User tracking (Issue #206)
     created_by_id: int | None = None
     created_by_username: str | None = None
+
+    # Per-archive run aggregates (#1378). Computed from PrintLogEntry — one
+    # row per actual print event — so reprints contribute to these counters
+    # without overwriting the source archive's first-run data.
+    run_count: int = 0
+    last_run_at: datetime | None = None
+    total_filament_actual_grams: float | None = None
+    successful_run_count: int = 0
+    failed_run_count: int = 0
 
     @model_validator(mode="after")
     def compute_object_count(self) -> "ArchiveResponse":
@@ -127,8 +155,10 @@ class ArchiveSlim(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     cost: float | None
+    energy_kwh: float | None = None
+    energy_cost: float | None = None
     quantity: int = 1
-    created_at: datetime
+    created_at: datetime | None
 
     class Config:
         from_attributes = True
@@ -138,11 +168,19 @@ class ArchiveStats(BaseModel):
     total_prints: int
     successful_prints: int
     failed_prints: int
+    # User/system-stopped prints (PrintLogEntry.status in stopped/cancelled/
+    # skipped). Defaulted so older clients that don't send this field still
+    # validate against historical fixtures.
+    cancelled_prints: int = 0
     total_print_time_hours: float
     total_filament_grams: float
     total_cost: float
     prints_by_filament_type: dict
     prints_by_printer: dict
+    # Name each printer id was last recorded under in the print log. Lets the
+    # client keep labelling history that belongs to a deleted printer (#2873);
+    # a printer that still exists is named from the live record instead.
+    printer_names: dict[str, str] = {}
     # Time accuracy stats
     # Average across all prints with data
     average_time_accuracy: float | None = None
@@ -206,24 +244,3 @@ class ProjectPageUpdate(BaseModel):
     copyright: str | None = None
     profile_title: str | None = None
     profile_description: str | None = None
-
-
-class ReprintRequest(BaseModel):
-    """Request body for reprinting an archive."""
-
-    # Plate selection for multi-plate 3MF files
-    # If not specified, auto-detects from file (legacy behavior for single-plate files)
-    plate_id: int | None = None
-    plate_name: str | None = None
-
-    # AMS slot mapping: list of tray IDs for each filament slot in the 3MF
-    # Global tray ID = (ams_id * 4) + slot_id, external = 254
-    ams_mapping: list[int] | None = None
-
-    # Print options
-    bed_levelling: bool = True
-    flow_cali: bool = False
-    vibration_cali: bool = True
-    layer_inspect: bool = False
-    timelapse: bool = False
-    use_ams: bool = True  # Not exposed in UI, but needed for API

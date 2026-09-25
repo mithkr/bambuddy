@@ -1,8 +1,9 @@
 """Integration tests for security_headers_middleware (#1191).
 
 Default behaviour is strict: ``X-Frame-Options: SAMEORIGIN`` plus
-``frame-ancestors 'none'`` on the catch-all route, ``frame-ancestors 'self'``
-on /gcode-viewer/. Operators can opt into iframe embedding from trusted
+``frame-ancestors 'none'`` on the catch-all route, and ``frame-ancestors
+'self'`` on the streaming overlay, which the Settings URL builder previews
+same-origin. Operators can opt into iframe embedding from trusted
 origins (e.g. Home Assistant on a different port) via the
 ``TRUSTED_FRAME_ORIGINS`` env var; when set, X-Frame-Options is dropped and
 ``frame-ancestors`` includes the allowlist.
@@ -114,6 +115,43 @@ async def test_default_headers_strict(async_client: AsyncClient, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_overlay_route_allows_same_origin_framing(async_client: AsyncClient, monkeypatch):
+    """#1422 — the overlay is framed same-origin by the URL builder's preview.
+
+    'none' blocks that too, which is why the preview showed Firefox's "will not
+    allow Firefox to display the page if another site has embedded it". 'self'
+    permits only a framer on this origin — Bambuddy's own UI — so a
+    clickjacking page on another host is refused exactly as before.
+    """
+    from backend.app import main as main_module
+
+    monkeypatch.setattr(main_module, "_TRUSTED_FRAME_ORIGINS", ())
+
+    resp = await async_client.get("/overlay/1")
+    csp = resp.headers.get("Content-Security-Policy", "")
+    assert "frame-ancestors 'self';" in csp
+    # The legacy header already permitted same-origin framing; only the CSP was
+    # blocking it. Assert it still says so rather than being dropped.
+    assert resp.headers.get("X-Frame-Options") == "SAMEORIGIN"
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_other_spa_routes_still_refuse_all_framing(async_client: AsyncClient, monkeypatch):
+    """The #1422 carve-out is the overlay path only — everything else keeps
+    'none', including paths that merely start with something similar."""
+    from backend.app import main as main_module
+
+    monkeypatch.setattr(main_module, "_TRUSTED_FRAME_ORIGINS", ())
+
+    for path in ("/", "/settings", "/printers", "/overlays", "/camwall"):
+        resp = await async_client.get(path)
+        csp = resp.headers.get("Content-Security-Policy", "")
+        assert "frame-ancestors 'none'" in csp, f"{path} must not be framable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_trusted_origins_relaxes_csp_and_drops_xfo(async_client: AsyncClient, monkeypatch):
     """With env var set: X-Frame-Options is absent, frame-ancestors lists the origins."""
     from backend.app import main as main_module
@@ -150,6 +188,39 @@ async def test_trusted_origins_applies_to_docs_branch(async_client: AsyncClient,
 
 @pytest.mark.asyncio
 @pytest.mark.integration
+async def test_default_block_img_src_excludes_https(async_client: AsyncClient, monkeypatch):
+    """#1333 regression guard: the default SPA CSP must NOT allow img-src https:.
+
+    Bambuddy's policy for external images is a backend proxy (see
+    /api/v1/makerworld/thumbnail and /api/v1/auth/oidc/providers/{id}/icon),
+    not a CSP relaxation. If a future change adds ``https:`` to img-src to
+    "fix" a broken-image, the proxy pattern silently degrades into a
+    do-nothing layer and the entire SPA gains a hot-link surface.
+    """
+    from backend.app import main as main_module
+
+    monkeypatch.setattr(main_module, "_TRUSTED_FRAME_ORIGINS", ())
+
+    resp = await async_client.get("/api/v1/auth/status")
+    csp = resp.headers.get("Content-Security-Policy", "")
+    # Extract the img-src directive — splits on ';' for safety against
+    # neighbouring directives that happen to contain the substring.
+    img_src_directive = next(
+        (d.strip() for d in csp.split(";") if d.strip().startswith("img-src")),
+        "",
+    )
+    assert img_src_directive, f"img-src directive missing from CSP: {csp!r}"
+    assert "https:" not in img_src_directive, (
+        f"img-src must not allow arbitrary https: hosts (proxy external images instead); got: {img_src_directive!r}"
+    )
+    # Sanity: the legitimately allowed scheme sources are still present.
+    assert "'self'" in img_src_directive
+    assert "data:" in img_src_directive
+    assert "blob:" in img_src_directive
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_other_security_headers_unchanged(async_client: AsyncClient, monkeypatch):
     """Other headers (X-Content-Type-Options, Referrer-Policy) are not affected."""
     from backend.app import main as main_module
@@ -160,3 +231,78 @@ async def test_other_security_headers_unchanged(async_client: AsyncClient, monke
         resp = await async_client.get("/api/v1/auth/status")
         assert resp.headers.get("X-Content-Type-Options") == "nosniff"
         assert resp.headers.get("Referrer-Policy") == "strict-origin-when-cross-origin"
+
+
+# ─── #1460: nonce-based script-src so Cloudflare-injected scripts pass ────
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_spa_csp_includes_per_request_script_nonce(async_client: AsyncClient):
+    """SPA CSP must stamp a fresh `'nonce-…'` token into script-src (#1460).
+
+    Cloudflare's bot-detection inline script is injected after our response
+    leaves the app, with a per-load hash that defeats hash allowlisting. When
+    a nonce is present in the CSP header, Cloudflare clones it onto its
+    injected `<script>` and the CSP passes without `'unsafe-inline'`.
+    """
+    import re
+
+    resp = await async_client.get("/api/v1/auth/status")
+    csp = resp.headers.get("Content-Security-Policy", "")
+    # Pull out the script-src directive (split on ';' so neighbours don't confuse us).
+    script_src = next(
+        (d.strip() for d in csp.split(";") if d.strip().startswith("script-src")),
+        "",
+    )
+    assert script_src, f"script-src directive missing: {csp!r}"
+    assert "'self'" in script_src, f"script-src must still allow 'self': {script_src!r}"
+    # Nonce token is `'nonce-<base64url>'` where the inner value is
+    # secrets.token_urlsafe(16) — about 22 url-safe chars.
+    assert re.search(r"'nonce-[A-Za-z0-9_-]{16,}'", script_src), (
+        f"script-src must include a 'nonce-…' token: {script_src!r}"
+    )
+    # We deliberately did NOT add 'unsafe-inline' alongside the nonce — that
+    # would defeat the purpose of using a nonce in the first place.
+    assert "'unsafe-inline'" not in script_src, (
+        f"script-src must not relax to 'unsafe-inline' on the SPA route: {script_src!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_spa_csp_nonce_changes_per_request(async_client: AsyncClient):
+    """A nonce is only useful if it's fresh per request (#1460)."""
+    import re
+
+    nonce_re = re.compile(r"'nonce-([A-Za-z0-9_-]+)'")
+
+    nonces = set()
+    for _ in range(5):
+        resp = await async_client.get("/api/v1/auth/status")
+        csp = resp.headers.get("Content-Security-Policy", "")
+        m = nonce_re.search(csp)
+        assert m, f"no nonce in CSP: {csp!r}"
+        nonces.add(m.group(1))
+    # 5 random 16-byte tokens collide with probability ~0 — anything less
+    # than all-5-distinct means we're handing out a stale/global nonce.
+    assert len(nonces) == 5, f"nonces should be per-request, got {nonces!r}"
+
+
+# ─── #1460: HEAD on PWA bootstrap routes (manifest / sw / sw-register) ───
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+@pytest.mark.parametrize("path", ["/manifest.json", "/sw.js", "/sw-register.js"])
+async def test_pwa_bootstrap_routes_accept_head(async_client: AsyncClient, path: str):
+    """Scanners and `curl -I` HEAD-probe these — must not 405 (#1460).
+
+    Previously these were `@app.get` only, so HEAD returned 405 Method Not
+    Allowed and looked like a manifest/SW server-side bug when debugging
+    Cloudflare-fronted deployments.
+    """
+    resp = await async_client.head(path)
+    # 200 if static asset is present in the test environment, 404 if it's
+    # not packaged in this checkout — but never 405.
+    assert resp.status_code != 405, f"HEAD {path} returned 405 — route must accept HEAD as well as GET"

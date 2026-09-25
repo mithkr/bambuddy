@@ -1,0 +1,230 @@
+"""What a rejected Orca Cloud refresh is allowed to do to stored credentials.
+
+The refresh token is single-use and rotating, and Orca reports every rejection
+with one composite reason (``unknown, expired, revoked, or already used``), so
+Bambuddy cannot tell a genuine revocation from a lost rotation race. Routes may
+still clear on that signal — a person is looking at the page and can pair again
+— but a background job must not, or an unattended run can destroy a working
+pairing (#2717).
+"""
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy import select
+
+from backend.app.api.routes.orca_cloud import _SETTINGS_KEYS, _build_authenticated_service
+from backend.app.models.settings import Settings
+from backend.app.services.orca_cloud import OrcaCloudAuthError, OrcaCloudError
+
+
+async def _store_global_credentials(db):
+    """An auth-disabled install's Orca credentials, expired so the helper
+    refreshes rather than returning straight away."""
+    db.add_all(
+        [
+            Settings(key=_SETTINGS_KEYS["token"], value="oc_ext_old"),
+            Settings(key=_SETTINGS_KEYS["refresh_token"], value="oc_ext_rt_old"),
+            Settings(key=_SETTINGS_KEYS["expires_at"], value="2000-01-01T00:00:00+00:00"),
+            Settings(key=_SETTINGS_KEYS["email"], value="a@b.c"),
+        ]
+    )
+    await db.commit()
+
+
+async def _stored_keys(db) -> set[str]:
+    result = await db.execute(select(Settings).where(Settings.key.in_(list(_SETTINGS_KEYS.values()))))
+    return {s.key for s in result.scalars().all()}
+
+
+def _expired_service(refresh_side_effect=None):
+    """A service that reports its access token as expired, so the helper takes
+    the refresh branch."""
+    svc = MagicMock()
+    svc.is_authenticated = False
+    svc.refresh_token = "oc_ext_rt_old"
+    svc.set_tokens = MagicMock()
+    svc.refresh = AsyncMock(side_effect=refresh_side_effect)
+    svc.access_token = "oc_ext_new"
+    svc.token_expiry = None
+    svc.close = AsyncMock()
+    return svc
+
+
+class TestRejectedRefresh:
+    @pytest.mark.asyncio
+    async def test_routes_clear_the_dead_pairing_by_default(self, db_session):
+        """Unchanged behaviour for interactive callers: the page flips to
+        disconnected while the user is there to pair again."""
+        await _store_global_credentials(db_session)
+        svc = _expired_service(OrcaCloudAuthError("grant already used"))
+
+        with (
+            patch("backend.app.api.routes.orca_cloud.OrcaCloudService", return_value=svc),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await _build_authenticated_service(db_session, None)
+
+        assert exc.value.status_code == 401
+        assert await _stored_keys(db_session) == set()
+
+    @pytest.mark.asyncio
+    async def test_background_callers_leave_the_credentials_alone(self, db_session):
+        """The whole point of the flag. A scheduled backup that guesses wrong
+        here destroys a pairing nobody asked it to touch, and the user finds
+        out when their profiles stop being backed up."""
+        await _store_global_credentials(db_session)
+        svc = _expired_service(OrcaCloudAuthError("grant already used"))
+
+        with (
+            patch("backend.app.api.routes.orca_cloud.OrcaCloudService", return_value=svc),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await _build_authenticated_service(db_session, None, clear_on_auth_failure=False)
+
+        # Still reported as a hard auth failure — the caller has to skip the
+        # account — but nothing was destroyed on the way out.
+        assert exc.value.status_code == 401
+        assert _SETTINGS_KEYS["token"] in await _stored_keys(db_session)
+        assert _SETTINGS_KEYS["refresh_token"] in await _stored_keys(db_session)
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_orca_never_clears_either_way(self, db_session):
+        """A transport failure says nothing about the credentials' validity."""
+        await _store_global_credentials(db_session)
+        svc = _expired_service(OrcaCloudError("connection reset"))
+
+        with (
+            patch("backend.app.api.routes.orca_cloud.OrcaCloudService", return_value=svc),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await _build_authenticated_service(db_session, None)
+
+        assert exc.value.status_code == 502
+        assert _SETTINGS_KEYS["token"] in await _stored_keys(db_session)
+
+
+class TestSuccessfulRefresh:
+    @pytest.mark.asyncio
+    async def test_the_rotated_pair_is_persisted_even_for_background_callers(self, db_session):
+        """Not optional: by the time the refresh succeeds the old token is
+        consumed, so failing to store the new pair would break a live pairing
+        for real. The flag suppresses destruction, never persistence.
+        """
+        await _store_global_credentials(db_session)
+        svc = _expired_service()
+        svc.refresh_token = "oc_ext_rt_new"
+
+        with patch("backend.app.api.routes.orca_cloud.OrcaCloudService", return_value=svc):
+            returned = await _build_authenticated_service(db_session, None, clear_on_auth_failure=False)
+
+        assert returned is svc
+        result = await db_session.execute(select(Settings).where(Settings.key == _SETTINGS_KEYS["token"]))
+        assert result.scalar_one().value == "oc_ext_new"
+        result = await db_session.execute(select(Settings).where(Settings.key == _SETTINGS_KEYS["refresh_token"]))
+        assert result.scalar_one().value == "oc_ext_rt_new"
+
+
+class TestTheClientIsNotLeakedOnFailure:
+    """A built service owns an httpx client from construction.
+
+    On success the caller closes it. On failure nobody is ever handed it, so
+    the builder has to close it itself -- otherwise every failed build leaks a
+    client into the connection pool. Harmless enough while the only callers
+    were routes, where a person retries a broken sign-in a handful of times;
+    it stopped being harmless once spool assignment started building one per
+    Orca-referenced spool, which fails on every assignment for as long as the
+    stored credentials cannot be refreshed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_refresh_closes_it(self, db_session):
+        await _store_global_credentials(db_session)
+        svc = _expired_service(OrcaCloudAuthError("grant already used"))
+
+        with (
+            patch("backend.app.api.routes.orca_cloud.OrcaCloudService", return_value=svc),
+            pytest.raises(HTTPException),
+        ):
+            await _build_authenticated_service(db_session, None)
+
+        svc.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_orca_closes_it(self, db_session):
+        await _store_global_credentials(db_session)
+        svc = _expired_service(OrcaCloudError("connection reset"))
+
+        with (
+            patch("backend.app.api.routes.orca_cloud.OrcaCloudService", return_value=svc),
+            pytest.raises(HTTPException),
+        ):
+            await _build_authenticated_service(db_session, None, clear_on_auth_failure=False)
+
+        svc.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_expired_token_with_nothing_to_refresh_closes_it(self, db_session):
+        """The earliest raise, before any network call -- and the one easiest
+        to miss, since it is a bare `raise` rather than an except block."""
+        await _store_global_credentials(db_session)
+        svc = _expired_service()
+        svc.refresh_token = ""
+
+        with (
+            patch("backend.app.api.routes.orca_cloud.OrcaCloudService", return_value=svc),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await _build_authenticated_service(db_session, None)
+
+        assert exc.value.status_code == 401
+        svc.refresh.assert_not_awaited()
+        svc.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_build_closes_it_and_stays_cancelled(self, db_session):
+        """CancelledError is a BaseException, so an `except Exception` guard
+        would let the client leak on shutdown -- and swallowing it here would
+        break cancellation itself, which is the worse of the two bugs."""
+        await _store_global_credentials(db_session)
+        svc = _expired_service(asyncio.CancelledError())
+
+        with (
+            patch("backend.app.api.routes.orca_cloud.OrcaCloudService", return_value=svc),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await _build_authenticated_service(db_session, None)
+
+        svc.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_failing_close_does_not_mask_the_real_error(self, db_session):
+        """Cleanup is best-effort. The caller needs the auth failure, not
+        whatever went wrong tidying up after it."""
+        await _store_global_credentials(db_session)
+        svc = _expired_service(OrcaCloudAuthError("grant already used"))
+        svc.close = AsyncMock(side_effect=RuntimeError("pool already shut down"))
+
+        with (
+            patch("backend.app.api.routes.orca_cloud.OrcaCloudService", return_value=svc),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await _build_authenticated_service(db_session, None)
+
+        assert exc.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_a_successful_build_leaves_it_open_for_the_caller(self, db_session):
+        """The other half of the contract: closing here would hand back a dead
+        client and break every route that uses one."""
+        await _store_global_credentials(db_session)
+        svc = _expired_service()
+        svc.refresh_token = "oc_ext_rt_new"
+
+        with patch("backend.app.api.routes.orca_cloud.OrcaCloudService", return_value=svc):
+            returned = await _build_authenticated_service(db_session, None)
+
+        assert returned is svc
+        svc.close.assert_not_awaited()

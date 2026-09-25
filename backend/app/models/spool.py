@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.app.core.database import Base
@@ -31,6 +31,12 @@ class Spool(Base):
         Integer
     )  # Reference to spool_catalog entry for core weight
     weight_used: Mapped[float] = mapped_column(Float, default=0)  # Consumed grams
+    # Anchor for the resettable "Total Consumed" stat. The displayed counter
+    # is `weight_used - weight_used_baseline`; the Inventory page's "Reset
+    # usage to 0" action stamps baseline = weight_used so the counter zeroes
+    # without disturbing remaining (= label_weight - weight_used). Matches
+    # Spoolman's split between used_weight and remaining_weight (#1390).
+    weight_used_baseline: Mapped[float] = mapped_column(Float, default=0)
     weight_locked: Mapped[bool] = mapped_column(Boolean, default=False)  # Lock weight from AMS auto-sync
     last_scale_weight: Mapped[int | None] = mapped_column(Integer)  # Last gross weight from scale (g)
     last_weighed_at: Mapped[datetime | None] = mapped_column(DateTime)  # When last weighed
@@ -55,6 +61,7 @@ class Spool(Base):
     cost_per_kg: Mapped[float | None] = mapped_column(Float)  # Cost per kilogram
 
     storage_location: Mapped[str | None] = mapped_column(String(255))  # User-editable storage location
+    location_id: Mapped[int | None] = mapped_column(ForeignKey("locations.id"), index=True)
 
     last_used: Mapped[datetime | None] = mapped_column(DateTime)  # Last time this spool was used in a print
     encode_time: Mapped[datetime | None] = mapped_column(DateTime)  # When spool was encoded/written to tag
@@ -67,8 +74,18 @@ class Spool(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
     k_profiles: Mapped[list["SpoolKProfile"]] = relationship(back_populates="spool", cascade="all, delete-orphan")
+    # Per-printer-model preset overrides. Deliberately NOT embedded in
+    # SpoolResponse the way k_profiles is: the inventory list returns every
+    # spool a user owns, and this list is only ever read by the spool form
+    # and the assign path, both of which fetch it for one spool at a time.
+    filament_presets: Mapped[list["SpoolFilamentPreset"]] = relationship(
+        back_populates="spool", cascade="all, delete-orphan"
+    )
     assignments: Mapped[list["SpoolAssignment"]] = relationship(back_populates="spool", cascade="all, delete-orphan")
+    location: Mapped["Location | None"] = relationship(back_populates="spools")
 
 
+from backend.app.models.location import Location  # noqa: E402
 from backend.app.models.spool_assignment import SpoolAssignment  # noqa: E402
+from backend.app.models.spool_filament_preset import SpoolFilamentPreset  # noqa: E402
 from backend.app.models.spool_k_profile import SpoolKProfile  # noqa: E402

@@ -6,7 +6,25 @@ import { Layers, Settings2, Package, Unlink, Link2, X } from 'lucide-react';
 import type { SpoolBuddyOutletContext } from '../../components/spoolbuddy/SpoolBuddyLayout';
 import { api } from '../../api/client';
 import type { PrinterStatus, AMSTray, SpoolAssignment } from '../../api/client';
-import { getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, formatSlotLabel, isBambuLabSpool } from '../../utils/amsHelpers';
+import { getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, formatSlotLabel, isBambuLabSpool, resolveSlotNozzleDiameter } from '../../utils/amsHelpers';
+import { getSwatchStyle, resolveSpoolColorName } from '../../utils/colors';
+
+/**
+ * " - Candy Red", or nothing when the colour has no name we can show.
+ *
+ * Not `spool.color_name`: a Bambu tag often carries no colour name, and
+ * Spoolman has no field for one at all, so the stored value is frequently
+ * empty or the spool's subtype standing in for it. The catalog resolves the
+ * swatch's own hex instead (#3090).
+ */
+function colorNameSuffix(spool: {
+  color_name: string | null;
+  rgba: string | null;
+  color_name_is_synthesized?: boolean;
+}): string {
+  const name = resolveSpoolColorName(spool.color_name, spool.rgba, spool.color_name_is_synthesized);
+  return name ? ` - ${name}` : '';
+}
 import { AmsUnitCard, HumidityIndicator, TemperatureIndicator, NozzleBadge } from '../../components/spoolbuddy/AmsUnitCard';
 import type { AmsThresholds } from '../../components/spoolbuddy/AmsUnitCard';
 import { ConfigureAmsSlotModal } from '../../components/ConfigureAmsSlotModal';
@@ -26,10 +44,11 @@ function mapModelCode(ssdpModel: string | null): string {
     'O1D': 'H2D', 'O1E': 'H2D Pro', 'O2D': 'H2D Pro', 'O1C': 'H2C', 'O1C2': 'H2C', 'O1S': 'H2S',
     'BL-P001': 'X1C', 'BL-P002': 'X1', 'BL-P003': 'X1E',
     'N6': 'X2D',
+    'N9': 'A2L',
     'C11': 'P1S', 'C12': 'P1P', 'C13': 'P2S',
     'N2S': 'A1', 'N1': 'A1 Mini',
     'X1C': 'X1C', 'X1': 'X1', 'X1E': 'X1E', 'X2D': 'X2D', 'P1S': 'P1S', 'P1P': 'P1P', 'P2S': 'P2S',
-    'A1': 'A1', 'A1 Mini': 'A1 Mini', 'H2D': 'H2D', 'H2D Pro': 'H2D Pro', 'H2C': 'H2C', 'H2S': 'H2S',
+    'A1': 'A1', 'A1 Mini': 'A1 Mini', 'A2L': 'A2L', 'H2D': 'H2D', 'H2D Pro': 'H2D Pro', 'H2C': 'H2C', 'H2S': 'H2S',
   };
   return modelMap[ssdpModel] || ssdpModel;
 }
@@ -136,16 +155,11 @@ export function SpoolBuddyAmsPage() {
   // Look up Spoolman fill level for a given tray
   const printerSerial = printer?.serial_number ?? '';
   const getSpoolmanFillForSlot = useCallback((amsId: number, trayId: number, tray: AMSTray | null): number | null => {
-    // Stage 1: tag-linked spool (linkedSpools map keyed by tag/UUID).
-    if (linkedSpools && printerSerial) {
-      const tag = (tray?.tray_uuid || tray?.tag_uid || getFallbackSpoolTag(printerSerial, amsId, trayId))?.toUpperCase();
-      const linkedSpool = tag ? linkedSpools[tag] : undefined;
-      const tagFill = getSpoolmanFillLevel(linkedSpool);
-      if (tagFill !== null) return tagFill;
-    }
-    // Stage 2: slot-assigned-only Spoolman spool (no tag link). Bug #6 in
-    // maintainer screenshot: spool was assigned to slot via AssignToAmsModal
-    // but never tag-linked, so the fill bar stayed empty.
+    // Stage 1: slot-assigned Spoolman spool. The user's explicit, recent
+    // action — must outrank the tag-link to avoid #1457, where a non-RFID
+    // slot's deterministic fallback tag stayed bound to the previous spool
+    // in Spoolman's extra.tag and the fill bar reported the old (stale)
+    // spool's remaining weight instead of the freshly assigned one.
     if (selectedPrinterId !== null && spoolmanSlotAssignmentsAll.length && spoolmanInventorySpoolsCache.length) {
       const slotAssign = spoolmanSlotAssignmentsAll.find(a =>
         a.printer_id === selectedPrinterId &&
@@ -158,6 +172,13 @@ export function SpoolBuddyAmsPage() {
           return Math.round(Math.max(0, spool.label_weight - spool.weight_used) / spool.label_weight * 100);
         }
       }
+    }
+    // Stage 2: tag-linked spool (linkedSpools map keyed by tag/UUID).
+    if (linkedSpools && printerSerial) {
+      const tag = (tray?.tray_uuid || tray?.tag_uid || getFallbackSpoolTag(printerSerial, amsId, trayId))?.toUpperCase();
+      const linkedSpool = tag ? linkedSpools[tag] : undefined;
+      const tagFill = getSpoolmanFillLevel(linkedSpool);
+      if (tagFill !== null) return tagFill;
     }
     return null;
   }, [linkedSpools, printerSerial, selectedPrinterId, spoolmanSlotAssignmentsAll, spoolmanInventorySpoolsCache]);
@@ -683,6 +704,7 @@ export function SpoolBuddyAmsPage() {
           printerId={selectedPrinterId}
           slotInfo={configureSlotModal}
           printerModel={mapModelCode(printer?.model ?? null) || undefined}
+          nozzleDiameter={resolveSlotNozzleDiameter(status, configureSlotModal.amsId)}
           fullScreen
           onSuccess={() => {
             queryClient.invalidateQueries({ queryKey: ['slotPresets', selectedPrinterId] });
@@ -746,17 +768,23 @@ export function SpoolBuddyAmsPage() {
                       {assignment.spool.rgba && (
                         <span
                           className="w-3 h-3 rounded-full border border-black/20 flex-shrink-0"
-                          style={{ backgroundColor: `#${assignment.spool.rgba.substring(0, 6)}` }}
+                          style={getSwatchStyle(assignment.spool.rgba)}
                         />
                       )}
                       <span className="text-sm text-white">
                         {assignment.spool.brand ? `${assignment.spool.brand} ` : ''}{assignment.spool.material}
-                        {assignment.spool.color_name ? ` - ${assignment.spool.color_name}` : ''}
+                        {assignment.spool.subtype ? ` ${assignment.spool.subtype}` : ''}
+                        {colorNameSuffix(assignment.spool)}
                       </span>
+                      <span className="text-[10px] font-mono text-zinc-500 shrink-0 ml-auto">#{assignment.spool.id}</span>
                     </div>
                   </div>
                 )}
-                {spoolmanEnabled && linked && (
+                {/* #1457: Assigned-spool block is rendered FIRST when a slot
+                    assignment exists, regardless of whether a (possibly stale)
+                    tag-link also exists. The tag-link block is the fallback
+                    for slots that have only a tag-link. */}
+                {spoolmanEnabled && linked && !spoolmanAssignedSpool && (
                   <div className="p-2.5 bg-bambu-dark rounded-lg border border-bambu-dark-tertiary mb-3">
                     <p className="text-xs text-bambu-gray mb-1">{t('spoolman.linkedSpool', 'Linked spool')}</p>
                     <div className="flex items-center gap-2">
@@ -767,19 +795,20 @@ export function SpoolBuddyAmsPage() {
                     </div>
                   </div>
                 )}
-                {spoolmanEnabled && !linked && spoolmanAssignedSpool && (
+                {spoolmanEnabled && spoolmanAssignedSpool && (
                   <div className="p-2.5 bg-bambu-dark rounded-lg border border-bambu-dark-tertiary mb-3">
                     <p className="text-xs text-bambu-gray mb-1">{t('inventory.assignedSpool', 'Assigned spool')}</p>
                     <div className="flex items-center gap-2">
                       {spoolmanAssignedSpool.rgba && (
                         <span
                           className="w-3 h-3 rounded-full border border-black/20 flex-shrink-0"
-                          style={{ backgroundColor: `#${spoolmanAssignedSpool.rgba.substring(0, 6)}` }}
+                          style={getSwatchStyle(spoolmanAssignedSpool.rgba)}
                         />
                       )}
                       <span className="text-sm text-white">
                         {spoolmanAssignedSpool.brand ? `${spoolmanAssignedSpool.brand} ` : ''}{spoolmanAssignedSpool.material}
-                        {spoolmanAssignedSpool.color_name ? ` - ${spoolmanAssignedSpool.color_name}` : ''}
+                        {spoolmanAssignedSpool.subtype ? ` ${spoolmanAssignedSpool.subtype}` : ''}
+                        {colorNameSuffix(spoolmanAssignedSpool)}
                       </span>
                     </div>
                   </div>

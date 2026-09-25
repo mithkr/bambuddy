@@ -66,7 +66,13 @@ class TestLocalInventoryLabels:
     @pytest.mark.integration
     async def test_all_four_templates_succeed(self, async_client: AsyncClient, spool_factory):
         s = await spool_factory()
-        for template in ("ams_30x15", "box_62x29", "avery_5160", "avery_l7160"):
+        for template in (
+            "ams_holder_74x33",
+            "ams_holder_75x55",
+            "box_62x29",
+            "avery_5160",
+            "avery_l7160",
+        ):
             resp = await async_client.post(
                 "/api/v1/inventory/labels",
                 json={"spool_ids": [s.id], "template": template},
@@ -100,7 +106,7 @@ class TestLocalInventoryLabels:
         s = await spool_factory()
         resp = await async_client.post(
             "/api/v1/inventory/labels",
-            json={"spool_ids": [s.id, 99999], "template": "ams_30x15"},
+            json={"spool_ids": [s.id, 99999], "template": "ams_holder_74x33"},
         )
         assert resp.status_code == 404
         assert "99999" in resp.text
@@ -123,9 +129,9 @@ class TestLocalInventoryLabels:
 
         original = labels_module.render_labels
 
-        def _capture(template, data_list):
+        def _capture(template, data_list, **kwargs):
             captured["ids"] = [d.spool_id for d in data_list]
-            return original(template, data_list)
+            return original(template, data_list, **kwargs)
 
         with patch.object(labels_module, "render_labels", side_effect=_capture):
             resp = await async_client.post(
@@ -134,6 +140,29 @@ class TestLocalInventoryLabels:
             )
         assert resp.status_code == 200
         assert captured["ids"] == [s3.id, s1.id, s2.id]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_forwards_sheet_starting_position(self, async_client: AsyncClient, spool_factory):
+        spool = await spool_factory()
+
+        from backend.app.api.routes import labels as labels_module
+
+        captured = {}
+        original = labels_module.render_labels
+
+        def _capture(template, data_list, **kwargs):
+            captured["starting_position"] = kwargs["starting_position"]
+            return original(template, data_list, **kwargs)
+
+        with patch.object(labels_module, "render_labels", side_effect=_capture):
+            resp = await async_client.post(
+                "/api/v1/inventory/labels",
+                json={"spool_ids": [spool.id], "template": "avery_5160", "starting_position": 8},
+            )
+
+        assert resp.status_code == 200
+        assert captured["starting_position"] == 8
 
 
 # ── /spoolman/labels (Spoolman-backed) ───────────────────────────────────────
@@ -231,6 +260,24 @@ class TestSpoolmanLabels:
 
 
 class TestValidation:
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize(
+        ("template", "starting_position"),
+        (("avery_5160", 0), ("avery_5160", 31), ("avery_l7160", 22), ("box_62x29", 2)),
+    )
+    async def test_invalid_starting_position_rejected(
+        self,
+        async_client: AsyncClient,
+        template: str,
+        starting_position: int,
+    ):
+        resp = await async_client.post(
+            "/api/v1/inventory/labels",
+            json={"spool_ids": [1], "template": template, "starting_position": starting_position},
+        )
+        assert resp.status_code == 422
+
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_request_body_size_capped(self, async_client: AsyncClient):

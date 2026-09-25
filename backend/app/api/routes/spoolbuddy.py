@@ -421,6 +421,11 @@ async def nfc_tag_scanned(
                             "material": mapped["material"],
                             "subtype": mapped["subtype"],
                             "color_name": mapped["color_name"],
+                            # Spoolman stores no colour name, so `color_name`
+                            # here is usually the spool's subtype standing in
+                            # for one. The kiosk needs to know that to prefer
+                            # the colour catalog over "Silk+" (#3090).
+                            "color_name_is_synthesized": mapped["color_name_is_synthesized"],
                             "rgba": mapped["rgba"],
                             "brand": mapped["brand"],
                             "label_weight": mapped["label_weight"],
@@ -485,6 +490,9 @@ async def nfc_tag_scanned(
                         "material": spool.material,
                         "subtype": spool.subtype,
                         "color_name": spool.color_name,
+                        # Local inventory stores what the user or their tag
+                        # set, and nothing else — never a stand-in (#3090).
+                        "color_name_is_synthesized": False,
                         "rgba": spool.rgba,
                         "brand": spool.brand,
                         "label_weight": spool.label_weight,
@@ -867,15 +875,28 @@ async def update_spool_weight(
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.INVENTORY_UPDATE),
 ):
-    """Update spool's used weight from scale reading."""
+    """Update spool's used weight from scale reading.
+
+    Routes the update to whichever inventory backend Bambuddy is configured
+    for: Spoolman exclusively when ``spoolman_enabled`` is true, local DB
+    exclusively otherwise. The previous implementation tried local first and
+    only consulted Spoolman on a local-DB miss, which meant a stale local row
+    sharing a numeric id with a Spoolman spool would silently absorb the
+    update while the Spoolman row the user is actually looking at stayed
+    unchanged (#1530). Mirrors the routing already used by ``nfc/tag-scanned``.
+    """
     from backend.app.api.routes._spoolman_helpers import _safe_float
     from backend.app.models.spool import Spool
 
-    # Try local DB first — local spool IDs must not be forwarded to Spoolman.
-    db_result = await db.execute(select(Spool).where(Spool.id == req.spool_id))
-    spool = db_result.scalar_one_or_none()
+    sm_client = await _get_spoolman_client_or_none(db)
 
-    if spool:
+    if sm_client is None:
+        # Local mode — exclusive update, no Spoolman fallback.
+        db_result = await db.execute(select(Spool).where(Spool.id == req.spool_id))
+        spool = db_result.scalar_one_or_none()
+        if not spool:
+            raise HTTPException(status_code=404, detail="Spool not found")
+
         net_filament = max(0, req.weight_grams - spool.core_weight)
         spool.weight_used = max(0, spool.label_weight - net_filament)
         spool.last_scale_weight = req.weight_grams
@@ -889,11 +910,7 @@ async def update_spool_weight(
         )
         return {"status": "ok", "weight_used": spool.weight_used}
 
-    # Local miss — fall back to Spoolman when enabled.
-    sm_client = await _get_spoolman_client_or_none(db)
-    if sm_client is None:
-        raise HTTPException(status_code=404, detail="Spool not found")
-
+    # Spoolman mode — exclusive update, never touch local DB.
     async with _translate_spoolbuddy_errors():
         sm_spool = await sm_client.get_spool(req.spool_id)
 

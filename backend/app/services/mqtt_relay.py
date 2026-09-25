@@ -15,6 +15,8 @@ from typing import Any
 
 import paho.mqtt.client as mqtt
 
+from backend.app.utils.paho_teardown import retire_paho_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -200,7 +202,7 @@ class MQTTRelayService:
                 self._disconnection_event = threading.Event()
                 self.client.disconnect()
                 await asyncio.to_thread(self._disconnection_event.wait, timeout=timeout)
-                self.client.loop_stop()
+                retire_paho_client(self.client, "relay")
             except Exception as e:
                 logger.debug("MQTT disconnect error (ignored): %s", e)
             finally:
@@ -240,7 +242,14 @@ class MQTTRelayService:
     # Printer Events
     # =========================================================================
 
-    async def on_printer_status(self, printer_id: int, state: Any, printer_name: str, printer_serial: str):
+    async def on_printer_status(
+        self,
+        printer_id: int,
+        state: Any,
+        printer_name: str,
+        printer_serial: str,
+        awaiting_plate_clear: bool = False,
+    ):
         """Publish printer status change (throttled to 1 update/sec per printer)."""
         if not self.enabled or not self.connected:
             return
@@ -275,11 +284,51 @@ class MQTTRelayService:
             "big_fan1_speed": state.big_fan1_speed,
             "big_fan2_speed": state.big_fan2_speed,
             "heatbreak_fan_speed": state.heatbreak_fan_speed,
+            "left_aux_fan_speed": state.left_aux_fan_speed,
+            "exhaust_fan_present": state.exhaust_fan_present,
+            # Bambuddy-side gate, not printer telemetry (#2525). Mirrors what the
+            # Web UI already receives via printer_state_to_dict, so an external
+            # automation can tell "finished" from "finished and still waiting for
+            # someone to clear the bed". Edge changes are also published on
+            # printers/{serial}/plate_clear — this topic only refreshes when the
+            # printer pushes telemetry, which stops entirely after Auto Off.
+            "awaiting_plate_clear": awaiting_plate_clear,
         }
 
         self._publish(
             f"{self.topic_prefix}/printers/{printer_serial}/status",
             payload,
+            retain=True,
+        )
+
+    async def on_plate_clear_state(
+        self,
+        printer_id: int,
+        printer_name: str,
+        printer_serial: str,
+        awaiting: bool,
+    ):
+        """Publish the plate-clear gate as it flips (#2525).
+
+        Retained, unlike the other per-printer event topics, because this is a
+        *state* an automation needs on subscribe rather than a moment it might
+        have missed. The status topic carries the same field, but only refreshes
+        when the printer pushes telemetry — after Auto Off cycles the printer the
+        retained status payload would sit at ``awaiting_plate_clear: false``
+        indefinitely while the gate is in fact still up.
+        """
+        if not self.enabled or not self.connected:
+            return
+
+        self._publish(
+            f"{self.topic_prefix}/printers/{printer_serial}/plate_clear",
+            {
+                "printer_id": printer_id,
+                "printer_name": printer_name,
+                "printer_serial": printer_serial,
+                "awaiting": awaiting,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
             retain=True,
         )
 

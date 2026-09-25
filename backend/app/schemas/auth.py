@@ -93,6 +93,40 @@ class UserResponse(BaseModel):
         from_attributes = True
 
 
+class UserSlim(BaseModel):
+    """Just enough to resolve a user id to a display name (#1894).
+
+    Deliberately narrower than ``UserResponse``: no email, role, auth source,
+    group membership or permission set. Adding a field here widens what every
+    ``can_read_status`` API key can read about every account, so treat this
+    shape as the contract rather than a starting point.
+    """
+
+    id: int
+    username: str
+
+    class Config:
+        from_attributes = True
+
+
+class LDAPSearchResultResponse(BaseModel):
+    """One match from GET /auth/ldap/search — surfaced in the admin UI."""
+
+    username: str
+    email: str | None = None
+    display_name: str | None = None
+    dn: str
+    already_provisioned: bool = False  # True if this username already exists as a BamBuddy user
+
+
+class LDAPProvisionRequest(BaseModel):
+    """Body for POST /auth/ldap/provision. Username is re-resolved via the
+    service-account bind, so the request only carries the directory username
+    the admin picked from the search results."""
+
+    username: str = Field(..., max_length=150)
+
+
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(..., max_length=256)  # M-NEW-3: cap before pbkdf2
     new_password: str = Field(..., min_length=8, max_length=256)
@@ -310,37 +344,69 @@ def _validate_email_claim_name(v: str) -> str:
 
 
 def _validate_icon_url(v: str | None) -> str | None:
-    """Reject non-HTTPS icon URLs to prevent SSRF / mixed-content issues."""
+    """Reject non-HTTPS icon URLs and SSRF-unsafe hosts.
+
+    Delegates to the runtime SSRF guard ``assert_safe_public_https_url``
+    so the Pydantic layer enforces the same allowlist as the fetcher —
+    no policy drift between schema validation and SSRF check. Without
+    this delegation the validator covered only ``is_private | is_loopback
+    | is_link_local`` while the runtime additionally rejected numeric-
+    encoded IPs, cloud-metadata endpoints, multicast, unspecified, and
+    IPv4-mapped IPv6.
+
+    Lazy-imported because ``_oidc_helpers`` lives under ``api/routes/``
+    and schemas avoid top-level imports from that layer (matches the
+    existing pattern in ``_validate_issuer_url`` which lazy-imports
+    ``ipaddress``).
+    """
     if v is None:
         return v
     if not v.startswith("https://"):
+        # Surface the same wording the runtime guard would use, but pre-
+        # checked here so the user-facing error doesn't depend on the
+        # runtime call path.
         raise ValueError("icon_url must start with https://")
+    from backend.app.api.routes._oidc_helpers import assert_safe_public_https_url
+
+    try:
+        assert_safe_public_https_url(v)
+    except ValueError as exc:
+        raise ValueError(f"icon_url: {exc}") from exc
     return v
 
 
 def _validate_issuer_url(v: str | None) -> str | None:
-    """Nit4: Reject non-HTTPS issuer URLs and private/loopback/link-local hosts.
+    """Reject non-HTTPS issuer URLs and SSRF-unsafe hosts.
 
-    HTTP is no longer accepted — OIDC providers must be reachable over TLS.
-    Private-network and loopback addresses are rejected to prevent SSRF attacks
-    where an admin-supplied URL could reach internal services.
+    An OIDC provider must be reachable over TLS on the public internet, so
+    this uses the public-internet policy: private, loopback and link-local
+    addresses are all rejected.
+
+    Delegates to the runtime guard ``assert_safe_public_https_url`` for the
+    same reason ``_validate_icon_url`` does — no policy drift between the
+    schema layer and the fetcher. The hand-rolled version this replaced
+    checked only ``is_private | is_loopback | is_link_local``, which left
+    numeric-encoded IPs (``https://2130706433/``), IPv4-mapped IPv6
+    (``https://[::ffff:127.0.0.1]/``), multicast and unspecified addresses
+    able to express a target the policy meant to forbid. The guard's
+    docstring already claimed the two were consistent; now they are.
+
+    Lazy-imported because ``_oidc_helpers`` lives under ``api/routes/`` and
+    schemas avoid top-level imports from that layer.
     """
-    import ipaddress
-    from urllib.parse import urlparse
-
     if v is None:
         return v
     if not v.startswith("https://"):
         raise ValueError("issuer_url must start with https://")
-    host = urlparse(v).hostname or ""
+    from backend.app.api.routes._oidc_helpers import assert_safe_public_https_url
+
     try:
-        addr = ipaddress.ip_address(host)
-        if addr.is_private or addr.is_loopback or addr.is_link_local:
-            raise ValueError("issuer_url must not point to a private, loopback, or link-local address")
+        assert_safe_public_https_url(v)
     except ValueError as exc:
-        if "issuer_url" in str(exc):
-            raise
-        # hostname is a domain name, not a bare IP — that's fine
+        # The guard's messages say "icon URL" — rewrite for this field so the
+        # user sees the setting they actually submitted.
+        detail = str(exc).replace("icon URL", "issuer_url")
+        raise ValueError(detail) from exc
     return v
 
 
@@ -372,6 +438,7 @@ class OIDCProviderCreate(BaseModel):
     require_email_verified: bool = True
     icon_url: str | None = None
     default_group_id: int | None = None
+    is_autologin: bool = False  # #1589 — at most one provider may carry this
 
     @field_validator("issuer_url")
     @classmethod
@@ -428,6 +495,7 @@ class OIDCProviderUpdate(BaseModel):
     require_email_verified: bool | None = None
     icon_url: str | None = None
     default_group_id: int | None = None
+    is_autologin: bool | None = None  # #1589
 
     @field_validator("scopes")
     @classmethod
@@ -474,6 +542,16 @@ class OIDCProviderResponse(BaseModel):
     require_email_verified: bool = True
     icon_url: str | None = None
     default_group_id: int | None = None
+    is_autologin: bool = False  # #1589
+    # #2593 — the UI renders this provider read-only; without the flag it would
+    # offer editable fields whose writes the API then refuses with 409.
+    is_env_managed: bool = False
+    # Set explicitly in the route handler from `icon_content_type is not None`
+    # rather than `@computed_field` (project policy) or `icon_data is not None`
+    # (would trigger an async lazy-load on the deferred BLOB column).
+    # Required (no default) so Pydantic fails loudly if any code path skips
+    # `_build_provider_response` and tries `model_validate(provider)` directly.
+    has_icon: bool
 
     class Config:
         from_attributes = True

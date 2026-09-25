@@ -28,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     libcap2-bin \
     openssh-client \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the Tailscale CLI only (no tailscaled — the daemon runs on the host).
@@ -53,7 +54,7 @@ RUN setcap cap_net_bind_service=+ep "$(readlink -f /usr/local/bin/python3)"
 # wheels (so a hostile wheel could hijack stdlib imports during install).
 COPY requirements.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --root-user-action=ignore --upgrade 'pip>=26.1' \
+    pip install --root-user-action=ignore --upgrade 'pip>=26.1.2' \
  && pip install --root-user-action=ignore -r requirements.txt
 
 # Copy backend
@@ -70,15 +71,6 @@ COPY .git/HEAD ./.git/HEAD
 
 # Copy built frontend from builder stage
 COPY --from=frontend-builder /app/static ./static
-
-# Copy embedded GCode viewer static assets (PrettyGCode + Bambuddy adapter).
-# Served by the explicit @app.get("/gcode-viewer/{...}") routes in main.py,
-# which resolve files under (static_dir.parent / "gcode_viewer") = /app/gcode_viewer/.
-# Without this COPY the routes return a bare 404 at request time and the 3D
-# Preview iframe shows {"detail":"Not Found"} (see #1218). The directory is
-# vendored third-party JS — the Vite build does NOT stage it into static/,
-# the dev server serves it via a configureServer middleware that's dev-only.
-COPY gcode_viewer/ ./gcode_viewer/
 
 # Create data directories. Ownership is normalised at startup by the
 # entrypoint (chowns to PUID:PGID and drops privileges via gosu before
@@ -121,6 +113,16 @@ ENV HOME=/app
 ENV USER=bambuddy
 ENV LOGNAME=bambuddy
 
+# Matplotlib (imported lazily by the STL thumbnail generator) tries to create
+# its font/style cache at $HOME/.config/matplotlib on first import. /app is
+# root-owned and not writable by the PUID:PGID the entrypoint drops to,
+# which trips an EPERM warning in everyone's logs and forces matplotlib
+# to fall back to a per-restart temp dir (paying the font-scan cost on
+# every container restart). Pinning the cache dir to /tmp/matplotlib
+# silences the warning and keeps the cache alive for the container's
+# lifetime. /tmp is writable by any uid, so this works regardless of PUID.
+ENV MPLCONFIGDIR=/tmp/matplotlib
+
 EXPOSE 322
 EXPOSE 990
 EXPOSE 3000
@@ -136,6 +138,22 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
 
 # Run the application
 # Use standard asyncio loop (uvloop has permission issues in some Docker environments)
-# Port is configurable via PORT environment variable (default: 8000)
+# Port is configurable via PORT (default 8000); bind address via HOST (default
+# 0.0.0.0). Set HOST=127.0.0.1 to bind loopback only, e.g. when a reverse proxy
+# on the same host fronts the app.
+#
+# `exec` is load-bearing, not style. Without it the shell stays as PID 1 and
+# uvicorn runs as its child; dash does not forward signals, so `docker stop`
+# SIGTERMs the shell and uvicorn never hears about it. Every stop then ran to
+# the end of the grace period and died on SIGKILL (exit 137) — no WAL
+# checkpoint, no MQTT disconnect, no virtual-printer teardown, on every restart
+# and every image update. With `exec`, uvicorn *is* PID 1 and gets the signal.
+#
+# --timeout-graceful-shutdown caps the wait on in-flight requests. Uvicorn's
+# default is to wait forever, and an MJPEG camera stream is a response that
+# never completes, so a single open camera tile would otherwise pin the process
+# past Docker's 10s grace and back into SIGKILL. On timeout uvicorn cancels the
+# request tasks; the camera generators already unwind cleanly on CancelledError.
+ENV UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN=5
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["sh", "-c", "uvicorn backend.app.main:app --host 0.0.0.0 --port ${PORT:-8000} --loop asyncio"]
+CMD ["sh", "-c", "exec uvicorn backend.app.main:app --host ${HOST:-0.0.0.0} --port ${PORT:-8000} --loop asyncio --timeout-graceful-shutdown ${UVICORN_TIMEOUT_GRACEFUL_SHUTDOWN}"]

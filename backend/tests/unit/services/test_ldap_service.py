@@ -11,14 +11,18 @@ are not tested here — they require a live LDAP server.
 """
 
 import pytest
+from ldap3.core.exceptions import LDAPObjectClassError
 
 from backend.app.services.ldap_service import (
     LDAPConfig,
+    LDAPSearchResult,
     LDAPUserInfo,
     _ldap_escape,
     authenticate_ldap_user,
+    lookup_ldap_user,
     parse_ldap_config,
     resolve_group_mapping,
+    search_ldap_users,
 )
 
 
@@ -294,10 +298,16 @@ class _MockConnection:
 
     _search_fixture: dict[str, list] = {}
     _instances: list["_MockConnection"] = []
+    # Filter substring that should raise LDAPObjectClassError instead of
+    # searching, standing in for ldap3's client-side schema validation — it
+    # rejects an object class the server's published schema doesn't define
+    # before the request is ever built (#2769).
+    _raise_object_class_error_on: str | None = None
 
     def __init__(self, *args, **kwargs):
         self.entries: list = []
         self.search_calls: list[str] = []
+        self.last_attrs: list | None = None
         _MockConnection._instances.append(self)
 
     def open(self):
@@ -312,8 +322,13 @@ class _MockConnection:
     def unbind(self):
         pass
 
-    def search(self, search_base=None, search_filter=None, search_scope=None, attributes=None):
+    def search(self, search_base=None, search_filter=None, search_scope=None, attributes=None, **kwargs):
+        # **kwargs absorbs ldap3 options like size_limit that the real client supports
         self.search_calls.append(search_filter or "")
+        self.last_attrs = list(attributes) if attributes is not None else None
+        needle = _MockConnection._raise_object_class_error_on
+        if needle and needle in (search_filter or ""):
+            raise LDAPObjectClassError(f"invalid class in objectClass attribute: {needle}")
         for needle, entries in _MockConnection._search_fixture.items():
             if needle in (search_filter or ""):
                 self.entries = entries
@@ -327,6 +342,7 @@ def mock_ldap(monkeypatch):
     """Patch Connection + _create_server in ldap_service so authenticate_ldap_user can run offline."""
     _MockConnection._search_fixture = {}
     _MockConnection._instances = []
+    _MockConnection._raise_object_class_error_on = None
     monkeypatch.setattr("backend.app.services.ldap_service.Connection", _MockConnection)
     monkeypatch.setattr("backend.app.services.ldap_service._create_server", lambda config: None)
     return _MockConnection
@@ -425,3 +441,266 @@ class TestAuthenticateLdapUserGroups:
         service_conn = _MockConnection._instances[0]
         gidnumber_searches = [call for call in service_conn.search_calls if "gidNumber=" in call]
         assert gidnumber_searches == []
+
+
+class TestDirectoryWithoutPosixGroupClass:
+    """A directory whose published schema defines no posixGroup class (#2769).
+
+    ldap3 fetches the schema at connect time (get_info=ALL) and validates object
+    class names in a filter against it before building the request, so both POSIX
+    group searches raise client-side and nothing reaches the server. lldap is the
+    case in the wild: it puts posixAccount on every account it creates, which
+    gives each user a gidNumber, but defines no group class beyond groupOfNames.
+    Left uncaught the exception escaped authenticate_ldap_user and the login route
+    reported it as "Incorrect username or password", so LDAP login was impossible.
+    """
+
+    def test_authenticates_and_keeps_memberof_groups(self, mock_ldap):
+        """The reporter's setup: the mapped membership comes from memberOf, which
+        is read off the user entry and never touches a posixGroup filter."""
+        user_entry = _MockEntry(
+            "uid=peter,ou=people,dc=fablab,dc=test",
+            uid="peter",
+            gidNumber=1001,  # lldap gives every account one
+            memberOf=["cn=AAUStudents,ou=groups,dc=fablab,dc=test"],
+        )
+        mock_ldap._search_fixture = {"(uid=peter)": [user_entry]}
+        mock_ldap._raise_object_class_error_on = "objectClass=posixGroup"
+
+        info = authenticate_ldap_user(_base_config(), "peter", "password")
+
+        assert info is not None
+        assert info.groups == ["cn=AAUStudents,ou=groups,dc=fablab,dc=test"]
+
+    def test_authenticates_with_no_groups_at_all(self, mock_ldap):
+        """No memberOf either. The user still gets in — auto-provisioning assigns
+        the configured default group, which is the whole point of that setting."""
+        user_entry = _MockEntry("uid=peter,ou=people,dc=fablab,dc=test", uid="peter", gidNumber=1001)
+        mock_ldap._search_fixture = {"(uid=peter)": [user_entry]}
+        mock_ldap._raise_object_class_error_on = "objectClass=posixGroup"
+
+        info = authenticate_ldap_user(_base_config(), "peter", "password")
+
+        assert info is not None
+        assert info.username == "peter"
+        assert info.groups == []
+
+    def test_abandons_the_primary_gid_search_after_the_first_rejection(self, mock_ldap):
+        """Both filters name the same class, so once one is rejected the other
+        cannot succeed. Attempting it would only produce a second identical
+        exception to swallow."""
+        user_entry = _MockEntry("uid=peter,ou=people,dc=fablab,dc=test", uid="peter", gidNumber=1001)
+        mock_ldap._search_fixture = {"(uid=peter)": [user_entry]}
+        mock_ldap._raise_object_class_error_on = "objectClass=posixGroup"
+
+        authenticate_ldap_user(_base_config(), "peter", "password")
+
+        service_conn = _MockConnection._instances[0]
+        posix_searches = [call for call in service_conn.search_calls if "posixGroup" in call]
+        assert len(posix_searches) == 1
+        assert "memberUid=peter" in posix_searches[0]
+
+    def test_a_directory_that_defines_the_class_is_untouched(self, mock_ldap):
+        """The guard must not cost a normal directory its POSIX groups — both
+        searches still run and both results still land."""
+        user_entry = _MockEntry("cn=mz,dc=test,dc=com", uid="mz", gidNumber=10002)
+        supplementary = _MockEntry("cn=bambuddy-viewers,ou=groups,dc=test,dc=com")
+        primary = _MockEntry("cn=bambuddy-operators,ou=groups,dc=test,dc=com")
+
+        mock_ldap._search_fixture = {
+            "(uid=mz)": [user_entry],
+            "memberUid=mz": [supplementary],
+            "gidNumber=10002": [primary],
+        }
+
+        info = authenticate_ldap_user(_base_config(), "mz", "password")
+
+        assert info.groups == [
+            "cn=bambuddy-viewers,ou=groups,dc=test,dc=com",
+            "cn=bambuddy-operators,ou=groups,dc=test,dc=com",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Manual provisioning helpers — search_ldap_users + lookup_ldap_user (#1298)
+# ---------------------------------------------------------------------------
+
+
+class TestSearchLdapUsers:
+    """Admin directory search for the manual-provision flow."""
+
+    def test_returns_empty_when_query_too_short(self, mock_ldap):
+        """Queries under 2 chars must not hit the directory at all."""
+        results = search_ldap_users(_base_config(), "a")
+        assert results == []
+        # No connection was opened — no Connection instance recorded.
+        assert _MockConnection._instances == []
+
+    def test_returns_empty_when_query_whitespace(self, mock_ldap):
+        results = search_ldap_users(_base_config(), "   ")
+        assert results == []
+        assert _MockConnection._instances == []
+
+    def test_filter_covers_all_common_attributes(self, mock_ldap):
+        """The fixed OR filter must cover sAMAccountName, uid, mail, displayName, cn."""
+        _MockConnection._search_fixture = {}  # any matching attr; empty result is fine
+        search_ldap_users(_base_config(), "jdoe")
+
+        assert len(_MockConnection._instances) == 1
+        sent = _MockConnection._instances[0].search_calls[0]
+        for attr in ("sAMAccountName=*jdoe*", "uid=*jdoe*", "mail=*jdoe*", "displayName=*jdoe*", "cn=*jdoe*"):
+            assert attr in sent, f"filter missing {attr}: {sent}"
+
+    def test_wildcard_in_query_is_escaped(self, mock_ldap):
+        """A typed * in the query must not enumerate the whole directory."""
+        _MockConnection._search_fixture = {}
+        search_ldap_users(_base_config(), "j*")
+
+        sent = _MockConnection._instances[0].search_calls[0]
+        # _ldap_escape replaces * with \2a; the outer wildcards (from our filter)
+        # must remain, but the user-supplied * must be escaped.
+        assert "*j\\2a*" in sent
+
+    def test_picks_samaccountname_first(self, mock_ldap):
+        entry = _MockEntry(
+            "cn=John Doe,dc=test,dc=com",
+            sAMAccountName="jdoe",
+            uid="jdoe-uid",
+            mail="jdoe@test.com",
+            displayName="John Doe",
+            cn="John Doe",
+        )
+        _MockConnection._search_fixture = {"sAMAccountName=*jdoe*": [entry]}
+
+        results = search_ldap_users(_base_config(), "jdoe")
+
+        assert len(results) == 1
+        assert isinstance(results[0], LDAPSearchResult)
+        assert results[0].username == "jdoe"  # sAMAccountName preferred
+        assert results[0].email == "jdoe@test.com"
+        assert results[0].display_name == "John Doe"
+        assert results[0].dn == "cn=John Doe,dc=test,dc=com"
+
+    def test_falls_back_to_uid_when_no_samaccountname(self, mock_ldap):
+        entry = _MockEntry("uid=alice,ou=people,dc=test,dc=com", uid="alice", cn="Alice")
+        _MockConnection._search_fixture = {"uid=*alice*": [entry]}
+
+        results = search_ldap_users(_base_config(), "alice")
+
+        assert len(results) == 1
+        assert results[0].username == "alice"
+
+    def test_falls_back_to_cn_when_neither_samaccountname_nor_uid(self, mock_ldap):
+        """Some OpenLDAP layouts only have cn — make sure we still surface them."""
+        entry = _MockEntry("cn=Bob,ou=people,dc=test,dc=com", cn="Bob")
+        _MockConnection._search_fixture = {"cn=*Bob*": [entry]}
+
+        results = search_ldap_users(_base_config(), "Bob")
+
+        assert len(results) == 1
+        assert results[0].username == "Bob"
+
+    def test_raises_when_service_bind_fails(self, mock_ldap, monkeypatch):
+        """Bind failures must propagate so the route can return 503 instead of [] (which
+        would look indistinguishable from 'no matches found' to the admin)."""
+
+        class _BindFailConn(_MockConnection):
+            def bind(self):
+                raise RuntimeError("simulated bind failure")
+
+        monkeypatch.setattr("backend.app.services.ldap_service.Connection", _BindFailConn)
+
+        with pytest.raises(RuntimeError):
+            search_ldap_users(_base_config(), "anyone")
+
+    def test_connection_skips_client_side_attribute_validation(self, mock_ldap, monkeypatch):
+        """OpenLDAP directories don't define sAMAccountName/displayName in their schema,
+        so ldap3 would raise LDAPAttributeError client-side before sending the query
+        — break the regression by asserting Connection is opened with check_names=False
+        for directory search."""
+        captured_kwargs: dict = {}
+
+        class _CapturingConn(_MockConnection):
+            def __init__(self, *args, **kwargs):
+                captured_kwargs.update(kwargs)
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr("backend.app.services.ldap_service.Connection", _CapturingConn)
+
+        search_ldap_users(_base_config(), "anyone")
+
+        assert captured_kwargs.get("check_names") is False, (
+            "search_ldap_users must open the connection with check_names=False — "
+            "otherwise ldap3 rejects sAMAccountName/displayName on OpenLDAP schemas"
+        )
+
+    def test_requests_all_user_attributes_to_bypass_schema_check(self, mock_ldap):
+        """ldap3's `build_attribute_selection` validates each named attribute against
+        the server schema regardless of check_names; only the `*` wildcard is in
+        its hard-coded exclusion list. So search_ldap_users MUST request `["*"]`
+        — not the explicit AD-flavoured names — or OpenLDAP servers raise
+        `LDAPAttributeError: invalid attribute type in attribute list: sAMAccountName`."""
+        _MockConnection._search_fixture = {}
+        search_ldap_users(_base_config(), "anyone")
+
+        # The mock's search() captures search_filter in search_calls but not
+        # attributes — so monkeypatch its signature briefly to capture both.
+        # Easier: re-grep ldap3 here. The mock's search() accepts kwargs via
+        # **kwargs; we just need to verify the attributes arg was the wildcard.
+        sent_attrs = _MockConnection._instances[0].last_attrs  # set by patched search
+        assert sent_attrs == ["*"], (
+            f"Expected attributes=['*'] to bypass ldap3 schema validation; got {sent_attrs!r}. "
+            "Explicit AD attribute names (sAMAccountName, displayName) make ldap3 throw on "
+            "OpenLDAP directories whose schema doesn't define them."
+        )
+
+
+class TestLookupLdapUser:
+    """Service-bind lookup used by the manual-provision route."""
+
+    def test_returns_none_when_user_missing(self, mock_ldap):
+        _MockConnection._search_fixture = {}  # nothing matches
+
+        result = lookup_ldap_user(_base_config(), "nobody")
+
+        assert result is None
+
+    def test_returns_user_info_with_groups(self, mock_ldap):
+        user_entry = _MockEntry(
+            "cn=John Doe,dc=test,dc=com",
+            uid="jdoe",
+            mail="jdoe@test.com",
+            displayName="John Doe",
+            memberOf=["cn=ops,ou=groups,dc=test,dc=com", "cn=qa,ou=groups,dc=test,dc=com"],
+        )
+        _MockConnection._search_fixture = {"(uid=jdoe)": [user_entry]}
+
+        info = lookup_ldap_user(_base_config(), "jdoe")
+
+        assert info is not None
+        assert info.username == "jdoe"
+        assert info.email == "jdoe@test.com"
+        assert info.display_name == "John Doe"
+        assert set(info.groups) == {"cn=ops,ou=groups,dc=test,dc=com", "cn=qa,ou=groups,dc=test,dc=com"}
+
+    def test_does_not_attempt_password_bind(self, mock_ldap):
+        """lookup_ldap_user MUST NOT call the user-DN bind that authenticate_ldap_user
+        does — admins are using their own session, not the LDAP user's password."""
+        user_entry = _MockEntry("cn=jdoe,dc=test,dc=com", uid="jdoe")
+        _MockConnection._search_fixture = {"(uid=jdoe)": [user_entry]}
+
+        lookup_ldap_user(_base_config(), "jdoe")
+
+        # authenticate_ldap_user creates TWO Connection objects (service + user-bind).
+        # lookup_ldap_user must create only ONE.
+        assert len(_MockConnection._instances) == 1
+
+    def test_raises_when_service_bind_fails(self, mock_ldap, monkeypatch):
+        class _BindFailConn(_MockConnection):
+            def bind(self):
+                raise RuntimeError("simulated bind failure")
+
+        monkeypatch.setattr("backend.app.services.ldap_service.Connection", _BindFailConn)
+
+        with pytest.raises(RuntimeError):
+            lookup_ldap_user(_base_config(), "anyone")

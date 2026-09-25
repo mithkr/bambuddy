@@ -1,8 +1,62 @@
 @import "tailwindcss";
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* Inter, self-hosted (#1460).  Bambuddy is a local-first, offline-capable PWA;
+   pulling the font from fonts.googleapis.com at runtime broke the install on
+   Android (CSP-blocked cross-origin fetch) and meant the UI couldn't render
+   offline.  These are the variable woff2 files Google Fonts serves — one file
+   covers every weight via the variable axis, so font-weight is a 100-900 range.
+   Files live in frontend/public/fonts/ and are served same-origin. */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/fonts/inter-latin.woff2') format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('/fonts/inter-latin-ext.woff2') format('woff2');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
 
 /* Enable class-based dark mode for Tailwind v4 */
 @custom-variant dark (&:where(.dark, .dark *));
+
+/* Hover-capable pointer only (#2865).  Tailwind v4 compiles `hover:` AND
+   `group-hover:` inside `@media (hover: hover)`, so on a touch-only device the
+   reveal rule is never applied at all — a control written as
+   `opacity-0 group-hover:opacity-100` stays invisible forever, which is how the
+   project card's action menu became unreachable on a phone.  Gating the HIDING
+   half on this variant is what fixes it: with no hover-capable pointer the
+   element simply keeps its natural opacity.  Same query the history thumbnail
+   preview already uses further down. */
+@custom-variant can-hover (@media (hover: hover) and (pointer: fine));
+
+/* Restore the pointer cursor on interactive controls (#2791).  Tailwind v3's
+   Preflight set `button { cursor: pointer }`; v4 dropped it to match the
+   browser default of `cursor: default`, so every button in the app looked
+   unclickable unless someone remembered to add `cursor-pointer` by hand.
+   Only a handful of the ~930 buttons did, which is why the UI felt
+   inconsistent rather than uniformly wrong.
+
+   This lives in `base`, the lowest of Tailwind's cascade layers, so the
+   `cursor-not-allowed` / `disabled:cursor-*` utilities dotted around the
+   codebase still win.  The `:not(:disabled)` guard covers the elements that
+   are disabled without also carrying such a utility. */
+@layer base {
+  button:not(:disabled),
+  select:not(:disabled),
+  summary,
+  input[type="checkbox"]:not(:disabled),
+  input[type="radio"]:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
+}
 
 @theme {
   /* Accent colors - use CSS variables for theming */
@@ -57,6 +111,17 @@ html {
   --card-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
   --glow-color: transparent;
 
+  /* Tell the browser which appearance the page is in, so the parts of a form
+     control it draws itself follow the theme.  Bambuddy themes by
+     swapping CSS variables under a `.dark` class, which the browser cannot
+     see: without this declaration it assumes light and paints every native
+     widget internal that way -- number-input steppers, the date picker's
+     calendar button and its popup, `<select>` dropdowns, scrollbars, the
+     autofill highlight.  That is why the quantity steppers in the print
+     dialog were pale grey chips inside a dark field.  Only the widget
+     internals are affected; anything we set ourselves still wins. */
+  color-scheme: light;
+
   font-family: 'Inter', system-ui, sans-serif;
   line-height: 1.5;
   font-weight: 400;
@@ -68,6 +133,12 @@ html {
 
 /* Dark mode base */
 .dark {
+  /* Pairs with `color-scheme: light` on :root -- see the note there.  This
+     sits on `.dark` rather than on each `.dark.bg-*` palette because the
+     kiosk adds `dark` to <html> on its own (SpoolBuddyLayout), and every
+     palette is a dark one regardless of which background it picks. */
+  color-scheme: dark;
+
   --bg-primary: #1a1a1a;
   --bg-secondary: #2d2d2d;
   --bg-tertiary: #3d3d3d;
@@ -274,6 +345,16 @@ body {
 
 /* Override text-white to be theme-aware */
 .text-white {
+  color: var(--text-primary);
+}
+
+/* Same, for the hover variant (#1909).  Tailwind compiles `hover:text-white`
+   to `.hover\:text-white:hover`, a different selector the rule above never
+   matches -- so every one of the ~400 `text-bambu-gray hover:text-white`
+   controls turned literally white on hover and vanished against the light
+   theme's background.  Unlayered, like the rule above, so it outranks
+   Tailwind's `@layer utilities` output. */
+.hover\:text-white:hover {
   color: var(--text-primary);
 }
 
@@ -500,4 +581,37 @@ body {
 
 .calendar-scroll::-webkit-scrollbar-thumb:hover {
   background-color: color-mix(in srgb, var(--text-muted) 80%, transparent);
+}
+
+/* History row thumbnail hover-to-enlarge — desktop only (no hover on touch). */
+@media (hover: hover) and (pointer: fine) {
+  .history-thumb-hover:hover .history-thumb-preview {
+    opacity: 1;
+  }
+}
+
+/* Per-slot filament colour swatch in the slice modal (#2977). A native
+   <input type="color"> paints its value inside a fixed inner padding and its
+   own border, so at 14px the colour reads as a dot inside a pale ring rather
+   than as the round swatch it replaced. These reset both so the element is
+   nothing but the colour. */
+.slice-colour-swatch {
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  overflow: hidden;
+}
+
+.slice-colour-swatch::-webkit-color-swatch-wrapper {
+  padding: 0;
+}
+
+.slice-colour-swatch::-webkit-color-swatch {
+  border: none;
+  border-radius: 999px;
+}
+
+.slice-colour-swatch::-moz-color-swatch {
+  border: none;
+  border-radius: 999px;
 }

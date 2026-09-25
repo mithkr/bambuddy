@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.core.auth import check_permission, check_printer_access, get_api_key
+from backend.app.core.auth import check_printer_access, check_webhook_permission, get_api_key
 from backend.app.core.database import get_db
 from backend.app.models.api_key import APIKey
 from backend.app.models.archive import PrintArchive
@@ -68,7 +68,7 @@ async def webhook_add_to_queue(
 
     Requires 'can_queue' permission.
     """
-    check_permission(api_key, "queue")
+    await check_webhook_permission(db, api_key, "queue")
     check_printer_access(api_key, data.printer_id)
 
     # Verify archive exists
@@ -115,6 +115,10 @@ async def webhook_add_to_queue(
         scheduled_time=scheduled_time,
         require_previous_success=data.require_previous_success,
         auto_off_after=data.auto_off_after,
+        # Attribute to the key's owner so the item shows up under `queue:read_own`
+        # for the person whose key it is. Legacy keys predating per-user ownership
+        # have no `user_id`, and those rows stay ownerless.
+        created_by_id=api_key.user_id,
     )
     db.add(queue_item)
     await db.flush()
@@ -136,11 +140,20 @@ async def webhook_start_print(
     api_key: APIKey = Depends(get_api_key),
     db: AsyncSession = Depends(get_db),
 ):
-    """Start the next queued print on a printer.
+    """Trigger the next manual-start queue item on a printer.
+
+    Mirrors `POST /print-queue/{item_id}/start`: clears `manual_start` on
+    the next pending item so the scheduler picks it up — which handles
+    FTP upload, AMS mapping, and all print options (timelapse,
+    bed_levelling, etc.) correctly via the queue's stored fields. The
+    previous implementation called `printer_manager.start_print()`
+    directly with `archive_id` as the filename arg and no print options,
+    bypassing the upload step entirely and discarding the user's
+    workflow choices — it 500'd before ever reaching the printer.
 
     Requires 'can_control_printer' permission.
     """
-    check_permission(api_key, "control_printer")
+    await check_webhook_permission(db, api_key, "control_printer")
     check_printer_access(api_key, printer_id)
 
     # Get printer
@@ -163,25 +176,14 @@ async def webhook_start_print(
     if not queue_item:
         raise HTTPException(status_code=404, detail="No pending prints in queue")
 
-    # Check if printer is ready
-    status = printer_manager.get_status(printer_id)
-    if not status or not status.get("connected"):
-        raise HTTPException(status_code=503, detail="Printer not connected")
+    # Clear manual_start so the scheduler will dispatch. If the item was
+    # already auto-dispatchable this is a no-op; the scheduler will still
+    # pick it up on its next tick.
+    queue_item.manual_start = False
+    await db.commit()
+    await db.refresh(queue_item)
 
-    if status.get("state") not in ["IDLE", "FINISH", "FAILED"]:
-        raise HTTPException(status_code=409, detail=f"Printer is busy (state: {status.get('state')})")
-
-    # Start the print with plate_id if available
-    try:
-        await printer_manager.start_print(
-            printer_id,
-            queue_item.archive_id,
-            plate_id=queue_item.plate_id or 1,
-        )
-    except Exception as e:
-        logger.error("Failed to start print: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
+    logger.info("Webhook started queue item %s on printer %s", queue_item.id, printer_id)
     return {"message": "Print started", "queue_item_id": queue_item.id}
 
 
@@ -189,19 +191,23 @@ async def webhook_start_print(
 async def webhook_stop_print(
     printer_id: int,
     api_key: APIKey = Depends(get_api_key),
+    db: AsyncSession = Depends(get_db),
 ):
     """Stop the current print on a printer.
 
     Requires 'can_control_printer' permission.
     """
-    check_permission(api_key, "control_printer")
+    await check_webhook_permission(db, api_key, "control_printer")
     check_printer_access(api_key, printer_id)
 
     status = printer_manager.get_status(printer_id)
-    if not status or not status.get("connected"):
+    # `printer_manager.get_status(...)` returns a ``PrinterState`` dataclass
+    # (see backend/app/services/bambu_mqtt.py), not a dict — `.get(...)` on it
+    # raises AttributeError and surfaces as a generic 500 (#1584).
+    if not status or not status.connected:
         raise HTTPException(status_code=503, detail="Printer not connected")
 
-    if status.get("state") != "RUNNING":
+    if status.state != "RUNNING":
         raise HTTPException(status_code=409, detail="No print in progress")
 
     try:
@@ -217,19 +223,21 @@ async def webhook_stop_print(
 async def webhook_cancel_print(
     printer_id: int,
     api_key: APIKey = Depends(get_api_key),
+    db: AsyncSession = Depends(get_db),
 ):
     """Cancel the current print on a printer.
 
     Requires 'can_control_printer' permission.
     """
-    check_permission(api_key, "control_printer")
+    await check_webhook_permission(db, api_key, "control_printer")
     check_printer_access(api_key, printer_id)
 
     status = printer_manager.get_status(printer_id)
-    if not status or not status.get("connected"):
+    # Same dataclass-not-dict shape as stop_print above (#1584).
+    if not status or not status.connected:
         raise HTTPException(status_code=503, detail="Printer not connected")
 
-    if status.get("state") not in ["RUNNING", "PAUSE"]:
+    if status.state not in ["RUNNING", "PAUSE"]:
         raise HTTPException(status_code=409, detail="No print to cancel")
 
     try:
@@ -251,7 +259,7 @@ async def webhook_get_printer_status(
 
     Requires 'can_read_status' permission.
     """
-    check_permission(api_key, "read_status")
+    await check_webhook_permission(db, api_key, "read_status")
     check_printer_access(api_key, printer_id)
 
     # Get printer
@@ -262,14 +270,18 @@ async def webhook_get_printer_status(
 
     status = printer_manager.get_status(printer_id)
 
+    # `printer_manager.get_status(...)` returns a ``PrinterState`` dataclass —
+    # attribute access, not dict lookup. The previous `.get(...)` calls raised
+    # AttributeError and surfaced as a generic 500 for any printer that
+    # actually had a status row (#1584).
     return PrinterStatusResponse(
         id=printer.id,
         name=printer.name,
-        connected=status.get("connected", False) if status else False,
-        state=status.get("state") if status else None,
-        current_print=status.get("current_print") if status else None,
-        progress=status.get("progress") if status else None,
-        remaining_time=status.get("remaining_time") if status else None,
+        connected=status.connected if status else False,
+        state=status.state if status else None,
+        current_print=status.current_print if status else None,
+        progress=status.progress if status else None,
+        remaining_time=status.remaining_time if status else None,
     )
 
 
@@ -283,7 +295,7 @@ async def webhook_get_queue_status(
 
     Requires 'can_read_status' permission.
     """
-    check_permission(api_key, "read_status")
+    await check_webhook_permission(db, api_key, "read_status")
 
     # Get printers
     if printer_id:

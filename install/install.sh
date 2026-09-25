@@ -332,6 +332,26 @@ create_user() {
     log_success "Service user created"
 }
 
+# Ensure a directory exists and is owned by the current user. Used on macOS so
+# the install tree stays user-owned (git/venv/npm never touch a root-owned dir).
+# Only elevates when the target's parent is root-owned (e.g. /opt); a path under
+# $HOME is created without any sudo prompt.
+ensure_user_owned_dir() {
+    local dir="$1"
+
+    if [[ -d "$dir" ]] && [[ -w "$dir" ]]; then
+        return
+    fi
+
+    if mkdir -p "$dir" 2>/dev/null; then
+        return
+    fi
+
+    log_info "Creating $dir (requires your password)..."
+    sudo mkdir -p "$dir"
+    sudo chown "$(id -un):$(id -gn)" "$dir"
+}
+
 download_bambuddy() {
     log_info "Downloading BamBuddy..."
 
@@ -343,7 +363,23 @@ download_bambuddy() {
         exit 1
     fi
 
-    if [[ -d "$INSTALL_PATH/.git" ]]; then
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        # macOS has no service user — the whole install runs as the current user.
+        # Create the target user-owned (elevating only if its parent is root-owned,
+        # e.g. /opt), then clone/update without sudo so the venv/frontend the user
+        # builds next aren't fighting a root-owned tree.
+        ensure_user_owned_dir "$INSTALL_PATH"
+        if [[ -d "$INSTALL_PATH/.git" ]]; then
+            log_info "Existing installation found, updating..."
+            git config --global --add safe.directory "$INSTALL_PATH" 2>/dev/null || true
+            cd "$INSTALL_PATH"
+            git fetch origin
+            git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH" "origin/$BRANCH"
+            git reset --hard "origin/$BRANCH"
+        else
+            git clone --branch "$BRANCH" https://github.com/maziggy/bambuddy.git "$INSTALL_PATH"
+        fi
+    elif [[ -d "$INSTALL_PATH/.git" ]]; then
         log_info "Existing installation found, updating..."
         # Add safe.directory to avoid "dubious ownership" error when running as root
         git config --global --add safe.directory "$INSTALL_PATH" 2>/dev/null || true
@@ -385,6 +421,80 @@ setup_virtualenv() {
     fi
 
     log_success "Virtual environment configured"
+}
+
+# macOS attributes Local Network permission (TCC) to a process's code
+# signature, and judges a launchd-spawned process on its own rather than
+# letting it inherit the grant of the Terminal that started it. Homebrew's
+# Python is unsigned on Intel, so there is no identity for a grant to attach
+# to: every connection to a LAN address is dropped with no error the app can
+# log and no permission prompt, and the printer just reads as unreachable
+# (#3114).
+#
+# Signing only when currently unsigned is load-bearing, not tidiness. On
+# arm64 the linker ad-hoc signs every binary it produces, so the identity is
+# a hash of the file itself; re-signing rotates that hash, invalidates a
+# working grant, and causes the very outage this repairs -- on every update.
+# A python.org build carries a real Developer ID for the same reason it must
+# not be touched.
+#
+# Both the interpreter and the framework's Python.app are signed. The first
+# is what sys._base_executable resolves to (measured on an Apple Silicon
+# Homebrew install, inside and outside a venv, and named as the responsible
+# process in the reporter's own TCC log on Intel); the second is the separate
+# binary whose signature is what actually fixed his machine. Which of the two
+# macOS attributes could not be established from either, and signing both
+# costs nothing.
+sign_python_for_tcc() {
+    [[ "$OS_TYPE" == "macos" ]] || return 0
+
+    local python_bin base_exe framework target signed_any=0
+    local -a targets=()
+
+    python_bin="$INSTALL_PATH/venv/bin/python3"
+    if [[ ! -x "$python_bin" ]]; then
+        return 0
+    fi
+
+    if ! command -v codesign &>/dev/null; then
+        log_warn "codesign not found — skipping the macOS Local Network signing step."
+        log_info "If the printer turns out to be unreachable, install the Xcode command line"
+        log_info "tools with 'xcode-select --install' and re-run install/update_macos.sh."
+        return 0
+    fi
+
+    log_info "Checking the Python code signature (macOS Local Network permission)..."
+
+    base_exe="$("$python_bin" -c 'import os, sys; print(os.path.realpath(getattr(sys, "_base_executable", None) or sys.executable))' 2>/dev/null)" || return 0
+    if [[ -z "$base_exe" ]] || [[ ! -e "$base_exe" ]]; then
+        return 0
+    fi
+    targets+=("$base_exe")
+
+    # .../Versions/3.13/bin/python3.13 -> .../Versions/3.13/Resources/Python.app
+    framework="${base_exe%/bin/*}"
+    if [[ "$framework" != "$base_exe" ]] && [[ -d "$framework/Resources/Python.app" ]]; then
+        targets+=("$framework/Resources/Python.app")
+    fi
+
+    for target in "${targets[@]}"; do
+        if codesign -dv "$target" &>/dev/null; then
+            continue
+        fi
+        if codesign --force --sign - "$target" &>/dev/null; then
+            log_success "Ad-hoc signed $target"
+            signed_any=1
+        else
+            log_warn "Could not sign $target"
+            log_info "Bambuddy may be unable to reach the printer. Run this by hand:"
+            log_info "  codesign --force --sign - \"$target\""
+        fi
+    done
+
+    if [[ "$signed_any" -eq 0 ]]; then
+        log_success "Python already carries a code signature"
+    fi
+    return 0
 }
 
 check_node_version() {
@@ -472,9 +582,12 @@ build_frontend() {
 create_directories() {
     log_info "Creating data directories..."
 
-    sudo mkdir -p "$DATA_DIR" "$LOG_DIR"
-
-    if [[ "$OS_TYPE" != "macos" ]]; then
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        # Rootless: DATA_DIR/LOG_DIR default under the user-owned install path.
+        ensure_user_owned_dir "$DATA_DIR"
+        ensure_user_owned_dir "$LOG_DIR"
+    else
+        sudo mkdir -p "$DATA_DIR" "$LOG_DIR"
         sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR" "$LOG_DIR"
     fi
 
@@ -503,11 +616,15 @@ LOG_LEVEL=$LOG_LEVEL
 LOG_TO_FILE=true
 EOF
 
-    sudo mv /tmp/bambuddy.env "$env_file"
-    if [[ "$OS_TYPE" != "macos" ]]; then
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        # Rootless: install path is user-owned, so write it directly.
+        mv /tmp/bambuddy.env "$env_file"
+        chmod 600 "$env_file"
+    else
+        sudo mv /tmp/bambuddy.env "$env_file"
         sudo chown "$SERVICE_USER:$SERVICE_USER" "$env_file"
+        sudo chmod 600 "$env_file"
     fi
-    sudo chmod 600 "$env_file"
 
     log_success "Environment file created at $env_file"
 }
@@ -518,6 +635,42 @@ create_systemd_service() {
     fi
 
     log_info "Creating systemd service..."
+
+    # ProtectHome=true hides /home/* from the service, which breaks ExecStart
+    # when INSTALL_PATH lives under /home (issue #1685). Loosen to read-only in
+    # that case so the venv binary is still resolvable; ReadWritePaths below
+    # re-grants writes for the install/data/log dirs.
+    local protect_home="true"
+    if [[ "$INSTALL_PATH" == /home/* ]]; then
+        protect_home="read-only"
+    fi
+
+    # This function overwrites /etc/systemd/system/bambuddy.service outright. Any
+    # ReadWritePaths the operator added by hand — a NAS share for Scheduled
+    # Backups, typically — used to disappear with it, and the next backup failed
+    # with EROFS ("Read-only file system"), which reads like a permission problem
+    # and is not one (issue #2544). Back the old unit up and carry those paths
+    # forward.
+    local existing_unit="/etc/systemd/system/bambuddy.service"
+    local extra_rw=""
+    if [[ -f "$existing_unit" ]]; then
+        local backup_unit="${existing_unit}.bak-$(date +%Y%m%d-%H%M%S)"
+        sudo cp "$existing_unit" "$backup_unit"
+        log_info "Existing service backed up to $backup_unit"
+
+        local prev_rw
+        prev_rw=$(sudo grep -hE '^ReadWritePaths=' "$existing_unit" 2>/dev/null | sed 's/^ReadWritePaths=//' || true)
+        local p
+        for p in $prev_rw; do
+            case "$p" in
+                "$DATA_DIR" | "$LOG_DIR" | "$INSTALL_PATH") continue ;;
+            esac
+            extra_rw+=" $p"
+        done
+        if [[ -n "$extra_rw" ]]; then
+            log_info "Keeping custom writable paths from the previous service:$extra_rw"
+        fi
+    fi
 
     cat > /tmp/bambuddy.service << EOF
 [Unit]
@@ -539,9 +692,16 @@ Environment="DATA_DIR=$DATA_DIR"
 Environment="LOG_DIR=$LOG_DIR"
 Environment="TZ=$TIMEZONE"
 
-ExecStart=$INSTALL_PATH/venv/bin/uvicorn backend.app.main:app --host $BIND_ADDRESS --port $PORT
+# --loop asyncio required: uvloop can truncate VP FTP uploads (#1896)
+# --timeout-graceful-shutdown required: uvicorn otherwise waits forever for
+# in-flight requests, and an MJPEG camera stream never completes — one open
+# camera tile hangs the stop until systemd SIGKILLs, skipping the WAL
+# checkpoint and the MQTT / virtual-printer teardown.
+ExecStart=$INSTALL_PATH/venv/bin/uvicorn backend.app.main:app --host $BIND_ADDRESS --port $PORT --loop asyncio --timeout-graceful-shutdown 5
 Restart=on-failure
 RestartSec=5
+# Backstop only — uvicorn bounds its own wait at 5s and teardown takes ~1-2s.
+TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
 
@@ -552,8 +712,17 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=$DATA_DIR $LOG_DIR $INSTALL_PATH
+ProtectHome=$protect_home
+# ProtectSystem=strict makes EVERY path outside the ones below read-only for this
+# service — including a NAS share you mounted yourself and can write to from your
+# own shell. If you point Scheduled Backups at such a directory, add it here, or
+# better in a drop-in that survives a reinstall (#2544):
+#
+#   sudo systemctl edit bambuddy
+#   [Service]
+#   ReadWritePaths=/mnt/your-nas-share
+#
+ReadWritePaths=$DATA_DIR $LOG_DIR $INSTALL_PATH$extra_rw
 
 [Install]
 WantedBy=multi-user.target
@@ -604,6 +773,14 @@ create_launchd_service() {
         <string>$BIND_ADDRESS</string>
         <string>--port</string>
         <string>$PORT</string>
+        <!-- the loop asyncio flag below is required: uvloop can truncate VP FTP uploads, #1896 -->
+        <string>--loop</string>
+        <string>asyncio</string>
+        <!-- required: uvicorn otherwise waits forever for in-flight requests, and an
+             MJPEG camera stream never completes — one open camera tile hangs the stop
+             until launchd SIGKILLs, skipping the WAL checkpoint and MQTT teardown -->
+        <string>--timeout-graceful-shutdown</string>
+        <string>5</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$INSTALL_PATH</string>
@@ -832,6 +1009,27 @@ main() {
     detect_os
     log_success "Detected: $OS_TYPE (package manager: $PKG_MANAGER)"
 
+    # macOS must run rootless. Homebrew hard-refuses to run as root, and a venv
+    # / node_modules created by root can't be managed by the launchd agent (which
+    # runs as the user). Bail early with an actionable message instead of dying
+    # halfway through on "brew: running as root is not supported".
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        if [[ "$EUID" -eq 0 ]]; then
+            log_error "Don't run the macOS installer with sudo."
+            log_info  "Homebrew, the Python venv, and the launchd agent must all be created as your"
+            log_info  "normal user. Re-run without sudo (the script elevates only when it truly needs to):"
+            echo ""
+            echo "    ./install.sh"
+            echo ""
+            exit 1
+        fi
+        # /opt requires sudo to create and would leave a root-owned tree; default
+        # macOS installs to a user-owned location so the whole flow stays rootless.
+        if [[ "$DEFAULT_INSTALL_PATH" == "/opt/bambuddy" ]]; then
+            DEFAULT_INSTALL_PATH="$HOME/bambuddy"
+        fi
+    fi
+
     # Check/install Python
     if ! detect_python; then
         log_info "Python 3.10+ not found, will install..."
@@ -868,6 +1066,7 @@ main() {
 
     download_bambuddy
     setup_virtualenv
+    sign_python_for_tcc
     build_frontend
     create_directories
     create_env_file
